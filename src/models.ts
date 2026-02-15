@@ -44,11 +44,12 @@ export const MODEL_ALIASES: Record<string, string> = {
   "grok-fast": "xai/grok-4-fast-reasoning",
   "grok-code": "xai/grok-code-fast-1",
 
-  // NVIDIA (free)
+  // NVIDIA
   nvidia: "nvidia/gpt-oss-120b",
   "gpt-120b": "nvidia/gpt-oss-120b",
-  "gpt-20b": "nvidia/gpt-oss-20b",
-  free: "nvidia/gpt-oss-120b",
+
+  // Note: auto, free, eco, premium are virtual routing profiles registered in BLOCKRUN_MODELS
+  // They don't need aliases since they're already top-level model IDs
 };
 
 /**
@@ -84,15 +85,39 @@ type BlockRunModel = {
 };
 
 export const BLOCKRUN_MODELS: BlockRunModel[] = [
-  // Smart routing meta-model — proxy replaces with actual model
+  // Smart routing meta-models — proxy replaces with actual model
   // NOTE: Model IDs are WITHOUT provider prefix (OpenClaw adds "blockrun/" automatically)
   {
     id: "auto",
-    name: "BlockRun Smart Router",
+    name: "Auto (Smart Router - Balanced)",
     inputPrice: 0,
     outputPrice: 0,
     contextWindow: 1_050_000,
     maxOutput: 128_000,
+  },
+  {
+    id: "free",
+    name: "Free (NVIDIA GPT-OSS-120B only)",
+    inputPrice: 0,
+    outputPrice: 0,
+    contextWindow: 128_000,
+    maxOutput: 4_096,
+  },
+  {
+    id: "eco",
+    name: "Eco (Smart Router - Cost Optimized)",
+    inputPrice: 0,
+    outputPrice: 0,
+    contextWindow: 1_050_000,
+    maxOutput: 128_000,
+  },
+  {
+    id: "premium",
+    name: "Premium (Smart Router - Best Quality)",
+    inputPrice: 0,
+    outputPrice: 0,
+    contextWindow: 2_000_000,
+    maxOutput: 200_000,
   },
 
   // OpenAI GPT-5 Family
@@ -151,14 +176,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 128000,
     maxOutput: 16384,
   },
-  {
-    id: "openai/gpt-4.1-nano",
-    name: "GPT-4.1 Nano",
-    inputPrice: 0.1,
-    outputPrice: 0.4,
-    contextWindow: 128000,
-    maxOutput: 16384,
-  },
+  // gpt-4.1-nano removed - replaced by gpt-5-nano
   {
     id: "openai/gpt-4o",
     name: "GPT-4o",
@@ -178,25 +196,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     maxOutput: 16384,
   },
 
-  // OpenAI O-series (Reasoning)
-  {
-    id: "openai/o1",
-    name: "o1",
-    inputPrice: 15.0,
-    outputPrice: 60.0,
-    contextWindow: 200000,
-    maxOutput: 100000,
-    reasoning: true,
-  },
-  {
-    id: "openai/o1-mini",
-    name: "o1-mini",
-    inputPrice: 1.1,
-    outputPrice: 4.4,
-    contextWindow: 128000,
-    maxOutput: 65536,
-    reasoning: true,
-  },
+  // OpenAI O-series (Reasoning) - o1/o1-mini removed, replaced by o3/o4
   {
     id: "openai/o3",
     name: "o3",
@@ -338,15 +338,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     maxOutput: 16384,
     reasoning: true,
   },
-  {
-    id: "xai/grok-3-fast",
-    name: "Grok 3 Fast",
-    inputPrice: 5.0,
-    outputPrice: 25.0,
-    contextWindow: 131072,
-    maxOutput: 16384,
-    reasoning: true,
-  },
+  // grok-3-fast removed - too expensive ($5/$25), use grok-4-fast instead
   {
     id: "xai/grok-3-mini",
     name: "Grok 3 Mini",
@@ -403,21 +395,13 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
   {
     id: "xai/grok-4-0709",
     name: "Grok 4 (0709)",
-    inputPrice: 3.0,
-    outputPrice: 15.0,
+    inputPrice: 0.2,
+    outputPrice: 1.5,
     contextWindow: 131072,
     maxOutput: 16384,
     reasoning: true,
   },
-  {
-    id: "xai/grok-2-vision",
-    name: "Grok 2 Vision",
-    inputPrice: 2.0,
-    outputPrice: 10.0,
-    contextWindow: 131072,
-    maxOutput: 16384,
-    vision: true,
-  },
+  // grok-2-vision removed - old, 0 transactions
 
   // NVIDIA - Free/cheap models
   {
@@ -429,18 +413,10 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     maxOutput: 16384,
   },
   {
-    id: "nvidia/gpt-oss-20b",
-    name: "NVIDIA GPT-OSS 20B",
-    inputPrice: 0,
-    outputPrice: 0,
-    contextWindow: 128000,
-    maxOutput: 16384,
-  },
-  {
     id: "nvidia/kimi-k2.5",
     name: "NVIDIA Kimi K2.5",
-    inputPrice: 0.001,
-    outputPrice: 0.001,
+    inputPrice: 0.55,
+    outputPrice: 2.5,
     contextWindow: 262144,
     maxOutput: 16384,
   },
@@ -527,4 +503,14 @@ export function getModelContextWindow(modelId: string): number | undefined {
   const normalized = modelId.replace("blockrun/", "");
   const model = BLOCKRUN_MODELS.find((m) => m.id === normalized);
   return model?.contextWindow;
+}
+
+/**
+ * Check if a model has reasoning/thinking capabilities.
+ * Reasoning models may require reasoning_content in assistant tool_call messages.
+ */
+export function isReasoningModel(modelId: string): boolean {
+  const normalized = modelId.replace("blockrun/", "");
+  const model = BLOCKRUN_MODELS.find((m) => m.id === normalized);
+  return model?.reasoning ?? false;
 }

@@ -30,33 +30,139 @@ import {
   route,
   getFallbackChain,
   getFallbackChainFiltered,
+  calculateModelCost,
   DEFAULT_ROUTING_CONFIG,
   type RouterOptions,
   type RoutingDecision,
   type RoutingConfig,
   type ModelPricing,
 } from "./router/index.js";
-import { BLOCKRUN_MODELS, resolveModelAlias, getModelContextWindow } from "./models.js";
+import {
+  BLOCKRUN_MODELS,
+  resolveModelAlias,
+  getModelContextWindow,
+  isReasoningModel,
+} from "./models.js";
 import { logUsage, type UsageEntry } from "./logger.js";
 import { getStats } from "./stats.js";
 import { RequestDeduplicator } from "./dedup.js";
 import { BalanceMonitor } from "./balance.js";
+import { compressContext, shouldCompress, type NormalizedMessage } from "./compression/index.js";
 // Error classes available for programmatic use but not used in proxy
 // (universal free fallback means we don't throw balance errors anymore)
 // import { InsufficientFundsError, EmptyWalletError } from "./errors.js";
 import { USER_AGENT } from "./version.js";
 import { SessionStore, getSessionId, type SessionConfig } from "./session.js";
+import { checkForUpdates } from "./updater.js";
+import { PROXY_PORT } from "./config.js";
 
 const BLOCKRUN_API = "https://blockrun.ai/api";
+// Routing profile models - virtual models that trigger intelligent routing
 const AUTO_MODEL = "blockrun/auto";
-const AUTO_MODEL_SHORT = "auto"; // OpenClaw strips provider prefix
+
+const ROUTING_PROFILES = new Set([
+  "blockrun/free",
+  "free",
+  "blockrun/eco",
+  "eco",
+  "blockrun/auto",
+  "auto",
+  "blockrun/premium",
+  "premium",
+]);
 const FREE_MODEL = "nvidia/gpt-oss-120b"; // Free model for empty wallet fallback
 const HEARTBEAT_INTERVAL_MS = 2_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 180_000; // 3 minutes (allows for on-chain tx + LLM response)
-const DEFAULT_PORT = 8402;
-const MAX_FALLBACK_ATTEMPTS = 3; // Maximum models to try in fallback chain
+const MAX_FALLBACK_ATTEMPTS = 5; // Maximum models to try in fallback chain (increased from 3 to ensure cheap models are tried)
 const HEALTH_CHECK_TIMEOUT_MS = 2_000; // Timeout for checking existing proxy
 const RATE_LIMIT_COOLDOWN_MS = 60_000; // 60 seconds cooldown for rate-limited models
+const PORT_RETRY_ATTEMPTS = 5; // Max attempts to bind port (handles TIME_WAIT)
+const PORT_RETRY_DELAY_MS = 1_000; // Delay between retry attempts
+
+/**
+ * Transform upstream payment errors into user-friendly messages.
+ * Parses the raw x402 error and formats it nicely.
+ */
+function transformPaymentError(errorBody: string): string {
+  try {
+    // Try to parse the error JSON
+    const parsed = JSON.parse(errorBody) as {
+      error?: string;
+      details?: string;
+    };
+
+    // Check if this is a payment verification error
+    if (parsed.error === "Payment verification failed" && parsed.details) {
+      // Extract the nested JSON from details
+      // Format: "Verification failed: {json}\n"
+      const match = parsed.details.match(/Verification failed:\s*(\{.*\})/s);
+      if (match) {
+        const innerJson = JSON.parse(match[1]) as {
+          invalidMessage?: string;
+          invalidReason?: string;
+          payer?: string;
+        };
+
+        if (innerJson.invalidReason === "insufficient_funds" && innerJson.invalidMessage) {
+          // Parse "insufficient balance: 251 < 11463"
+          const balanceMatch = innerJson.invalidMessage.match(
+            /insufficient balance:\s*(\d+)\s*<\s*(\d+)/i,
+          );
+          if (balanceMatch) {
+            const currentMicros = parseInt(balanceMatch[1], 10);
+            const requiredMicros = parseInt(balanceMatch[2], 10);
+            const currentUSD = (currentMicros / 1_000_000).toFixed(6);
+            const requiredUSD = (requiredMicros / 1_000_000).toFixed(6);
+            const wallet = innerJson.payer || "unknown";
+            const shortWallet =
+              wallet.length > 12 ? `${wallet.slice(0, 6)}...${wallet.slice(-4)}` : wallet;
+
+            return JSON.stringify({
+              error: {
+                message: `Insufficient USDC balance. Current: $${currentUSD}, Required: ~$${requiredUSD}`,
+                type: "insufficient_funds",
+                wallet: wallet,
+                current_balance_usd: currentUSD,
+                required_usd: requiredUSD,
+                help: `Fund wallet ${shortWallet} with USDC on Base, or use free model: /model free`,
+              },
+            });
+          }
+        }
+
+        // Handle invalid_payload errors (signature issues, malformed payment)
+        if (innerJson.invalidReason === "invalid_payload") {
+          return JSON.stringify({
+            error: {
+              message: "Payment signature invalid. This may be a temporary issue.",
+              type: "invalid_payload",
+              help: "Try again. If this persists, reinstall ClawRouter: curl -fsSL https://blockrun.ai/ClawRouter-update | bash",
+            },
+          });
+        }
+      }
+    }
+
+    // Handle settlement failures (gas estimation, on-chain errors)
+    if (parsed.error === "Settlement failed" || parsed.details?.includes("Settlement failed")) {
+      const details = parsed.details || "";
+      const gasError = details.includes("unable to estimate gas");
+
+      return JSON.stringify({
+        error: {
+          message: gasError
+            ? "Payment failed: network congestion or gas issue. Try again."
+            : "Payment settlement failed. Try again in a moment.",
+          type: "settlement_failed",
+          help: "This is usually temporary. If it persists, try: /model free",
+        },
+      });
+    }
+  } catch {
+    // If parsing fails, return original
+  }
+  return errorBody;
+}
 
 /**
  * Track rate-limited models to avoid hitting them again.
@@ -137,17 +243,11 @@ function safeWrite(res: ServerResponse, data: string | Buffer): boolean {
 const BALANCE_CHECK_BUFFER = 1.5;
 
 /**
- * Get the proxy port from environment variable or default.
+ * Get the proxy port from pre-loaded configuration.
+ * Port is validated at module load time, this just returns the cached value.
  */
 export function getProxyPort(): number {
-  const envPort = process.env.BLOCKRUN_PROXY_PORT;
-  if (envPort) {
-    const parsed = parseInt(envPort, 10);
-    if (!isNaN(parsed) && parsed > 0 && parsed < 65536) {
-      return parsed;
-    }
-  }
-  return DEFAULT_PORT;
+  return PROXY_PORT;
 }
 
 /**
@@ -195,6 +295,9 @@ const PROVIDER_ERROR_PATTERNS = [
   /temporarily.*unavailable/i,
   /api.*key.*invalid/i,
   /authentication.*failed/i,
+  /request too large/i,
+  /request.*size.*exceeds/i,
+  /payload too large/i,
 ];
 
 /**
@@ -205,6 +308,7 @@ const FALLBACK_STATUS_CODES = [
   401, // Unauthorized - provider API key issues
   402, // Payment required - but from upstream, not x402
   403, // Forbidden - provider restrictions
+  413, // Payload too large - request exceeds model's context limit
   429, // Rate limited
   500, // Internal server error
   502, // Bad gateway
@@ -464,14 +568,21 @@ function normalizeMessagesForThinking(messages: ExtendedChatMessage[]): Extended
 
   let hasChanges = false;
   const normalized = messages.map((msg) => {
-    // Only process assistant messages with tool_calls that lack reasoning_content
-    if (
-      msg.role === "assistant" &&
-      msg.tool_calls &&
-      Array.isArray(msg.tool_calls) &&
-      msg.tool_calls.length > 0 &&
-      msg.reasoning_content === undefined
-    ) {
+    // Skip if not assistant or already has reasoning_content
+    if (msg.role !== "assistant" || msg.reasoning_content !== undefined) {
+      return msg;
+    }
+
+    // Check for OpenAI format: tool_calls array
+    const hasOpenAIToolCalls =
+      msg.tool_calls && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+
+    // Check for Anthropic format: content array with tool_use blocks
+    const hasAnthropicToolUse =
+      Array.isArray(msg.content) &&
+      (msg.content as Array<{ type?: string }>).some((block) => block?.type === "tool_use");
+
+    if (hasOpenAIToolCalls || hasAnthropicToolUse) {
       hasChanges = true;
       return { ...msg, reasoning_content: "" };
     }
@@ -501,6 +612,9 @@ const THINKING_BLOCK_RE =
 /**
  * Strip thinking tokens and blocks from model response content.
  * Handles both Kimi-style Unicode tokens and standard XML-style tags.
+ *
+ * NOTE: DSML tags (<｜DSML｜...>) are NOT stripped - those are tool calls
+ * that should be handled by the API, not hidden from users.
  */
 function stripThinkingTokens(content: string): string {
   if (!content) return content;
@@ -543,6 +657,24 @@ export type ProxyOptions = {
    * across requests within a session to prevent mid-task model switching.
    */
   sessionConfig?: Partial<SessionConfig>;
+  /**
+   * Auto-compress large requests to fit within API limits.
+   * When enabled, requests approaching 200KB are automatically compressed using
+   * LLM-safe context compression (15-40% reduction).
+   * Default: true
+   */
+  autoCompressRequests?: boolean;
+  /**
+   * Threshold in KB to trigger auto-compression (default: 180).
+   * Requests larger than this are compressed before sending.
+   * Set to 0 to compress all requests.
+   */
+  compressionThresholdKB?: number;
+  /**
+   * Maximum request size in KB after compression (default: 200).
+   * Hard limit enforced by BlockRun API.
+   */
+  maxRequestSizeKB?: number;
   onReady?: (port: number) => void;
   onError?: (error: Error) => void;
   onPayment?: (info: { model: string; amount: string; network: string }) => void;
@@ -811,108 +943,171 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
     }
   });
 
-  // Listen on configured port (already determined above)
-  return new Promise<ProxyHandle>((resolve, reject) => {
-    server.on("error", (err: NodeJS.ErrnoException) => {
-      // Handle EADDRINUSE gracefully — proxy is already running
-      if (err.code === "EADDRINUSE") {
-        // Port is in use, which means a proxy is already running.
-        // This can happen when openclaw logs triggers plugin reload.
-        // Silently reuse the existing proxy instead of failing.
+  // Listen on configured port with retry logic for TIME_WAIT handling
+  // When gateway restarts quickly, the port may still be in TIME_WAIT state.
+  // We retry with delay instead of incorrectly assuming a proxy is running.
+  const tryListen = (attempt: number): Promise<void> => {
+    return new Promise<void>((resolveAttempt, rejectAttempt) => {
+      const onError = async (err: NodeJS.ErrnoException) => {
+        server.removeListener("error", onError);
+
+        if (err.code === "EADDRINUSE") {
+          // Port is in use - check if a proxy is actually running
+          const existingWallet = await checkExistingProxy(listenPort);
+          if (existingWallet) {
+            // Proxy is actually running - this is fine, reuse it
+            console.log(`[ClawRouter] Existing proxy detected on port ${listenPort}, reusing`);
+            rejectAttempt({ code: "REUSE_EXISTING", wallet: existingWallet });
+            return;
+          }
+
+          // Port is in TIME_WAIT (no proxy responding) - retry after delay
+          if (attempt < PORT_RETRY_ATTEMPTS) {
+            console.log(
+              `[ClawRouter] Port ${listenPort} in TIME_WAIT, retrying in ${PORT_RETRY_DELAY_MS}ms (attempt ${attempt}/${PORT_RETRY_ATTEMPTS})`,
+            );
+            rejectAttempt({ code: "RETRY", attempt });
+            return;
+          }
+
+          // Max retries exceeded
+          console.error(
+            `[ClawRouter] Port ${listenPort} still in use after ${PORT_RETRY_ATTEMPTS} attempts`,
+          );
+          rejectAttempt(err);
+          return;
+        }
+
+        rejectAttempt(err);
+      };
+
+      server.once("error", onError);
+      server.listen(listenPort, "127.0.0.1", () => {
+        server.removeListener("error", onError);
+        resolveAttempt();
+      });
+    });
+  };
+
+  // Retry loop for port binding
+  let lastError: Error | undefined;
+  for (let attempt = 1; attempt <= PORT_RETRY_ATTEMPTS; attempt++) {
+    try {
+      await tryListen(attempt);
+      break; // Success
+    } catch (err: unknown) {
+      const error = err as { code?: string; wallet?: string; attempt?: number };
+
+      if (error.code === "REUSE_EXISTING" && error.wallet) {
+        // Proxy is running, reuse it
         const baseUrl = `http://127.0.0.1:${listenPort}`;
         options.onReady?.(listenPort);
-        resolve({
+        return {
           port: listenPort,
           baseUrl,
-          walletAddress: account.address,
+          walletAddress: error.wallet,
           balanceMonitor,
           close: async () => {
             // No-op: we didn't start this proxy, so we shouldn't close it
           },
-        });
-        return;
+        };
       }
-      reject(err);
+
+      if (error.code === "RETRY") {
+        // Wait before retry
+        await new Promise((r) => setTimeout(r, PORT_RETRY_DELAY_MS));
+        continue;
+      }
+
+      // Other error - throw
+      lastError = err as Error;
+      break;
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+
+  // Server is now listening - set up remaining handlers
+  const addr = server.address() as AddressInfo;
+  const port = addr.port;
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  options.onReady?.(port);
+
+  // Check for updates (non-blocking)
+  checkForUpdates();
+
+  // Add runtime error handler AFTER successful listen
+  // This handles errors that occur during server operation (not just startup)
+  server.on("error", (err) => {
+    console.error(`[ClawRouter] Server runtime error: ${err.message}`);
+    options.onError?.(err);
+    // Don't crash - log and continue
+  });
+
+  // Handle client connection errors (bad requests, socket errors)
+  server.on("clientError", (err, socket) => {
+    console.error(`[ClawRouter] Client error: ${err.message}`);
+    // Send 400 Bad Request if socket is still writable
+    if (socket.writable && !socket.destroyed) {
+      socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+    }
+  });
+
+  // Track connections for graceful cleanup
+  server.on("connection", (socket) => {
+    connections.add(socket);
+
+    // Set 5-minute timeout for streaming requests
+    socket.setTimeout(300_000);
+
+    socket.on("timeout", () => {
+      console.error(`[ClawRouter] Socket timeout, destroying connection`);
+      socket.destroy();
     });
 
-    server.listen(listenPort, "127.0.0.1", () => {
-      const addr = server.address() as AddressInfo;
-      const port = addr.port;
-      const baseUrl = `http://127.0.0.1:${port}`;
+    socket.on("end", () => {
+      // Half-closed by client (FIN received)
+    });
 
-      options.onReady?.(port);
+    socket.on("error", (err) => {
+      console.error(`[ClawRouter] Socket error: ${err.message}`);
+    });
 
-      // Add runtime error handler AFTER successful listen
-      // This handles errors that occur during server operation (not just startup)
-      server.on("error", (err) => {
-        console.error(`[ClawRouter] Server runtime error: ${err.message}`);
-        options.onError?.(err);
-        // Don't crash - log and continue
-      });
-
-      // Handle client connection errors (bad requests, socket errors)
-      server.on("clientError", (err, socket) => {
-        console.error(`[ClawRouter] Client error: ${err.message}`);
-        // Send 400 Bad Request if socket is still writable
-        if (socket.writable && !socket.destroyed) {
-          socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
-        }
-      });
-
-      // Track connections for graceful cleanup
-      server.on("connection", (socket) => {
-        connections.add(socket);
-
-        // Set 5-minute timeout for streaming requests
-        socket.setTimeout(300_000);
-
-        socket.on("timeout", () => {
-          console.error(`[ClawRouter] Socket timeout, destroying connection`);
-          socket.destroy();
-        });
-
-        socket.on("end", () => {
-          // Half-closed by client (FIN received)
-        });
-
-        socket.on("error", (err) => {
-          console.error(`[ClawRouter] Socket error: ${err.message}`);
-        });
-
-        socket.on("close", () => {
-          connections.delete(socket);
-        });
-      });
-
-      resolve({
-        port,
-        baseUrl,
-        walletAddress: account.address,
-        balanceMonitor,
-        close: () =>
-          new Promise<void>((res, rej) => {
-            const timeout = setTimeout(() => {
-              rej(new Error("[ClawRouter] Close timeout after 4s"));
-            }, 4000);
-
-            sessionStore.close();
-            // Destroy all active connections before closing server
-            for (const socket of connections) {
-              socket.destroy();
-            }
-            connections.clear();
-            server.close((err) => {
-              clearTimeout(timeout);
-              if (err) {
-                rej(err);
-              } else {
-                res();
-              }
-            });
-          }),
-      });
+    socket.on("close", () => {
+      connections.delete(socket);
     });
   });
+
+  return {
+    port,
+    baseUrl,
+    walletAddress: account.address,
+    balanceMonitor,
+    close: () =>
+      new Promise<void>((res, rej) => {
+        const timeout = setTimeout(() => {
+          rej(new Error("[ClawRouter] Close timeout after 4s"));
+        }, 4000);
+
+        sessionStore.close();
+        // Destroy all active connections before closing server
+        for (const socket of connections) {
+          socket.destroy();
+        }
+        connections.clear();
+        server.close((err) => {
+          clearTimeout(timeout);
+          if (err) {
+            rej(err);
+          } else {
+            res();
+          }
+        });
+      }),
+  };
 }
 
 /** Result of attempting a model request */
@@ -965,7 +1160,13 @@ async function tryModelRequest(
     }
 
     // Normalize messages for thinking-enabled requests (add reasoning_content to tool calls)
-    if (parsed.thinking && Array.isArray(parsed.messages)) {
+    // Check request flags AND target model - reasoning models have thinking enabled server-side
+    const hasThinkingEnabled = !!(
+      parsed.thinking ||
+      parsed.extended_thinking ||
+      isReasoningModel(modelId)
+    );
+    if (hasThinkingEnabled && Array.isArray(parsed.messages)) {
       parsed.messages = normalizeMessagesForThinking(parsed.messages as ExtendedChatMessage[]);
     }
 
@@ -1058,6 +1259,7 @@ async function proxyRequest(
   let isStreaming = false;
   let modelId = "";
   let maxTokens = 4096;
+  let routingProfile: "free" | "eco" | "auto" | "premium" | null = null;
   const isChatCompletion = req.url?.includes("/chat/completions");
 
   if (isChatCompletion && body.length > 0) {
@@ -1083,83 +1285,114 @@ async function proxyRequest(
       const resolvedModel = resolveModelAlias(normalizedModel);
       const wasAlias = resolvedModel !== normalizedModel;
 
-      const isAutoModel =
-        normalizedModel === AUTO_MODEL.toLowerCase() ||
-        normalizedModel === AUTO_MODEL_SHORT.toLowerCase();
+      const isRoutingProfile = ROUTING_PROFILES.has(normalizedModel);
+
+      // Extract routing profile type (free/eco/auto/premium)
+      if (isRoutingProfile) {
+        const profileName = normalizedModel.replace("blockrun/", "");
+        routingProfile = profileName as "free" | "eco" | "auto" | "premium";
+      }
 
       // Debug: log received model name
       console.log(
-        `[ClawRouter] Received model: "${parsed.model}" -> normalized: "${normalizedModel}"${wasAlias ? ` -> alias: "${resolvedModel}"` : ""}, isAuto: ${isAutoModel}`,
+        `[ClawRouter] Received model: "${parsed.model}" -> normalized: "${normalizedModel}"${wasAlias ? ` -> alias: "${resolvedModel}"` : ""}${routingProfile ? `, profile: ${routingProfile}` : ""}`,
       );
 
       // If alias was resolved, update the model in the request
-      if (wasAlias && !isAutoModel) {
+      if (wasAlias && !isRoutingProfile) {
         parsed.model = resolvedModel;
         modelId = resolvedModel;
         bodyModified = true;
       }
 
-      if (isAutoModel) {
-        // Check for session persistence - use pinned model if available
-        const sessionId = getSessionId(
-          req.headers as Record<string, string | string[] | undefined>,
-        );
-        const existingSession = sessionId ? sessionStore.getSession(sessionId) : undefined;
-
-        if (existingSession) {
-          // Use the session's pinned model instead of re-routing
-          console.log(
-            `[ClawRouter] Session ${sessionId?.slice(0, 8)}... using pinned model: ${existingSession.model}`,
-          );
-          parsed.model = existingSession.model;
-          modelId = existingSession.model;
+      // Handle routing profiles (free/eco/auto/premium)
+      if (isRoutingProfile) {
+        // Free profile - direct shortcut to nvidia/gpt-oss-120b (no tier routing)
+        if (routingProfile === "free") {
+          const freeModel = "nvidia/gpt-oss-120b";
+          console.log(`[ClawRouter] Free profile - using ${freeModel} directly`);
+          parsed.model = freeModel;
+          modelId = freeModel;
           bodyModified = true;
-          sessionStore.touchSession(sessionId!);
+
+          // Log usage for free profile
+          await logUsage({
+            timestamp: new Date().toISOString(),
+            model: freeModel,
+            tier: "SIMPLE",
+            cost: 0,
+            baselineCost: 0,
+            savings: 1.0, // 100% savings
+            latencyMs: 0,
+          });
         } else {
-          // No session or expired - route normally
-          // Extract prompt from messages
-          type ChatMessage = { role: string; content: string };
-          const messages = parsed.messages as ChatMessage[] | undefined;
-          let lastUserMsg: ChatMessage | undefined;
-          if (messages) {
-            for (let i = messages.length - 1; i >= 0; i--) {
-              if (messages[i].role === "user") {
-                lastUserMsg = messages[i];
-                break;
+          // eco/auto/premium - use tier routing
+          // Check for session persistence - use pinned model if available
+          const sessionId = getSessionId(
+            req.headers as Record<string, string | string[] | undefined>,
+          );
+          const existingSession = sessionId ? sessionStore.getSession(sessionId) : undefined;
+
+          if (existingSession) {
+            // Use the session's pinned model instead of re-routing
+            console.log(
+              `[ClawRouter] Session ${sessionId?.slice(0, 8)}... using pinned model: ${existingSession.model}`,
+            );
+            parsed.model = existingSession.model;
+            modelId = existingSession.model;
+            bodyModified = true;
+            sessionStore.touchSession(sessionId!);
+          } else {
+            // No session or expired - route normally
+            // Extract prompt from messages
+            type ChatMessage = { role: string; content: string };
+            const messages = parsed.messages as ChatMessage[] | undefined;
+            let lastUserMsg: ChatMessage | undefined;
+            if (messages) {
+              for (let i = messages.length - 1; i >= 0; i--) {
+                if (messages[i].role === "user") {
+                  lastUserMsg = messages[i];
+                  break;
+                }
               }
             }
+            const systemMsg = messages?.find((m: ChatMessage) => m.role === "system");
+            const prompt = typeof lastUserMsg?.content === "string" ? lastUserMsg.content : "";
+            const systemPrompt =
+              typeof systemMsg?.content === "string" ? systemMsg.content : undefined;
+
+            // Tool detection no longer forces agentic mode
+            // Agentic mode is now triggered by keyword-based detection (agenticScore >= 0.6)
+            // This allows simple queries with tools to use cheaper models
+            const tools = parsed.tools as unknown[] | undefined;
+            const hasTools = Array.isArray(tools) && tools.length > 0;
+
+            if (hasTools) {
+              console.log(
+                `[ClawRouter] Tools detected (${tools.length}), agentic mode via keywords`,
+              );
+            }
+
+            routingDecision = route(prompt, systemPrompt, maxTokens, {
+              ...routerOpts,
+              routingProfile: routingProfile ?? undefined,
+            });
+
+            // Replace model in body
+            parsed.model = routingDecision.model;
+            modelId = routingDecision.model;
+            bodyModified = true;
+
+            // Pin this model to the session for future requests
+            if (sessionId) {
+              sessionStore.setSession(sessionId, routingDecision.model, routingDecision.tier);
+              console.log(
+                `[ClawRouter] Session ${sessionId.slice(0, 8)}... pinned to model: ${routingDecision.model}`,
+              );
+            }
+
+            options.onRouted?.(routingDecision);
           }
-          const systemMsg = messages?.find((m: ChatMessage) => m.role === "system");
-          const prompt = typeof lastUserMsg?.content === "string" ? lastUserMsg.content : "";
-          const systemPrompt =
-            typeof systemMsg?.content === "string" ? systemMsg.content : undefined;
-
-          // Tool detection no longer forces agentic mode
-          // Agentic mode is now triggered by keyword-based detection (agenticScore >= 0.6)
-          // This allows simple queries with tools to use cheaper models
-          const tools = parsed.tools as unknown[] | undefined;
-          const hasTools = Array.isArray(tools) && tools.length > 0;
-
-          if (hasTools) {
-            console.log(`[ClawRouter] Tools detected (${tools.length}), agentic mode via keywords`);
-          }
-
-          routingDecision = route(prompt, systemPrompt, maxTokens, routerOpts);
-
-          // Replace model in body
-          parsed.model = routingDecision.model;
-          modelId = routingDecision.model;
-          bodyModified = true;
-
-          // Pin this model to the session for future requests
-          if (sessionId) {
-            sessionStore.setSession(sessionId, routingDecision.model, routingDecision.tier);
-            console.log(
-              `[ClawRouter] Session ${sessionId.slice(0, 8)}... pinned to model: ${routingDecision.model}`,
-            );
-          }
-
-          options.onRouted?.(routingDecision);
         }
       }
 
@@ -1173,6 +1406,101 @@ async function proxyRequest(
       console.error(`[ClawRouter] Routing error: ${errorMsg}`);
       options.onError?.(new Error(`Routing failed: ${errorMsg}`));
     }
+  }
+
+  // --- Auto-compression ---
+  // Compress large requests to fit within BlockRun API's 200KB limit
+  const autoCompress = options.autoCompressRequests ?? true;
+  const compressionThreshold = options.compressionThresholdKB ?? 180;
+  const sizeLimit = options.maxRequestSizeKB ?? 200;
+  const requestSizeKB = Math.ceil(body.length / 1024);
+
+  if (autoCompress && requestSizeKB > compressionThreshold) {
+    try {
+      console.log(
+        `[ClawRouter] Request size ${requestSizeKB}KB exceeds threshold ${compressionThreshold}KB, applying compression...`,
+      );
+
+      // Parse messages for compression
+      const parsed = JSON.parse(body.toString()) as {
+        messages?: NormalizedMessage[];
+        [key: string]: unknown;
+      };
+
+      if (parsed.messages && parsed.messages.length > 0 && shouldCompress(parsed.messages)) {
+        // Apply compression with conservative settings
+        const compressionResult = await compressContext(parsed.messages, {
+          enabled: true,
+          preserveRaw: false, // Don't need originals in proxy
+          layers: {
+            deduplication: true, // Safe: removes duplicate messages
+            whitespace: true, // Safe: normalizes whitespace
+            dictionary: false, // Disabled: requires model to understand codebook
+            paths: false, // Disabled: requires model to understand path codes
+            jsonCompact: true, // Safe: just removes JSON whitespace
+            observation: false, // Disabled: may lose important context
+            dynamicCodebook: false, // Disabled: requires model to understand codes
+          },
+          dictionary: {
+            maxEntries: 50,
+            minPhraseLength: 15,
+            includeCodebookHeader: false,
+          },
+        });
+
+        const compressedSizeKB = Math.ceil(compressionResult.compressedChars / 1024);
+        const savings = (((requestSizeKB - compressedSizeKB) / requestSizeKB) * 100).toFixed(1);
+
+        console.log(
+          `[ClawRouter] Compressed ${requestSizeKB}KB → ${compressedSizeKB}KB (${savings}% reduction)`,
+        );
+
+        // Update request body with compressed messages
+        parsed.messages = compressionResult.messages;
+        body = Buffer.from(JSON.stringify(parsed));
+
+        // If still too large after compression, reject
+        if (compressedSizeKB > sizeLimit) {
+          const errorMsg = {
+            error: {
+              message: `Request size ${compressedSizeKB}KB still exceeds limit after compression (original: ${requestSizeKB}KB). Please reduce context size.`,
+              type: "request_too_large",
+              original_size_kb: requestSizeKB,
+              compressed_size_kb: compressedSizeKB,
+              limit_kb: sizeLimit,
+              help: "Try: 1) Remove old messages from history, 2) Summarize large tool results, 3) Use direct API for very large contexts",
+            },
+          };
+
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(errorMsg));
+          return;
+        }
+      }
+    } catch (err) {
+      // Compression failed - continue with original request
+      console.warn(
+        `[ClawRouter] Compression failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Pre-validate request size even if compression wasn't attempted
+  const finalSizeKB = Math.ceil(body.length / 1024);
+  if (finalSizeKB > sizeLimit) {
+    const errorMsg = {
+      error: {
+        message: `Request size ${finalSizeKB}KB exceeds limit ${sizeLimit}KB. Please reduce context size.`,
+        type: "request_too_large",
+        size_kb: finalSizeKB,
+        limit_kb: sizeLimit,
+        help: "Try: 1) Remove old messages from history, 2) Summarize large tool results, 3) Enable compression (autoCompressRequests: true)",
+      },
+    };
+
+    res.writeHead(413, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(errorMsg));
+    return;
   }
 
   // --- Dedup check ---
@@ -1350,7 +1678,13 @@ async function proxyRequest(
       // Deprioritize rate-limited models (put them at the end)
       modelsToTry = prioritizeNonRateLimited(modelsToTry);
     } else {
-      modelsToTry = modelId ? [modelId] : [];
+      // For explicit model requests, add free model as emergency fallback
+      // in case the primary model fails due to insufficient funds mid-request
+      if (modelId && modelId !== FREE_MODEL) {
+        modelsToTry = [modelId, FREE_MODEL];
+      } else {
+        modelsToTry = modelId ? [modelId] : [];
+      }
     }
 
     // --- Fallback loop: try each model until success ---
@@ -1420,23 +1754,48 @@ async function proxyRequest(
     }
 
     // Update routing decision with actual model used (for logging)
+    // IMPORTANT: Recalculate cost for the actual model, not the original primary
     if (routingDecision && actualModelUsed !== routingDecision.model) {
+      const estimatedInputTokens = Math.ceil(body.length / 4);
+      const newCosts = calculateModelCost(
+        actualModelUsed,
+        routerOpts.modelPricing,
+        estimatedInputTokens,
+        maxTokens,
+        routingProfile ?? undefined,
+      );
       routingDecision = {
         ...routingDecision,
         model: actualModelUsed,
         reasoning: `${routingDecision.reasoning} | fallback to ${actualModelUsed}`,
+        costEstimate: newCosts.costEstimate,
+        baselineCost: newCosts.baselineCost,
+        savings: newCosts.savings,
       };
       options.onRouted?.(routingDecision);
     }
 
     // --- Handle case where all models failed ---
     if (!upstream) {
-      const errBody = lastError?.body || "All models in fallback chain failed";
+      const rawErrBody = lastError?.body || "All models in fallback chain failed";
       const errStatus = lastError?.status || 502;
+
+      // Transform payment errors into user-friendly messages
+      const transformedErr = transformPaymentError(rawErrBody);
 
       if (headersSentEarly) {
         // Streaming: send error as SSE event
-        const errEvent = `data: ${JSON.stringify({ error: { message: errBody, type: "provider_error", status: errStatus } })}\n\n`;
+        // If transformed error is already JSON, parse and use it; otherwise wrap in standard format
+        let errPayload: string;
+        try {
+          const parsed = JSON.parse(transformedErr);
+          errPayload = JSON.stringify(parsed);
+        } catch {
+          errPayload = JSON.stringify({
+            error: { message: rawErrBody, type: "provider_error", status: errStatus },
+          });
+        }
+        const errEvent = `data: ${errPayload}\n\n`;
         safeWrite(res, errEvent);
         safeWrite(res, "data: [DONE]\n\n");
         res.end();
@@ -1449,20 +1808,14 @@ async function proxyRequest(
           completedAt: Date.now(),
         });
       } else {
-        // Non-streaming: send error response
+        // Non-streaming: send transformed error response
         res.writeHead(errStatus, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            error: { message: errBody, type: "provider_error" },
-          }),
-        );
+        res.end(transformedErr);
 
         deduplicator.complete(dedupKey, {
           status: errStatus,
           headers: { "content-type": "application/json" },
-          body: Buffer.from(
-            JSON.stringify({ error: { message: errBody, type: "provider_error" } }),
-          ),
+          body: Buffer.from(transformedErr),
           completedAt: Date.now(),
         });
       }
@@ -1593,7 +1946,10 @@ async function proxyRequest(
                     index,
                     delta: {},
                     logprobs: null,
-                    finish_reason: choice.finish_reason ?? "stop",
+                    finish_reason:
+                      toolCalls && toolCalls.length > 0
+                        ? "tool_calls"
+                        : (choice.finish_reason ?? "stop"),
                   },
                 ],
               };
@@ -1692,14 +2048,28 @@ async function proxyRequest(
   }
 
   // --- Usage logging (fire-and-forget) ---
+  // Note: Recalculate cost using full body length (not just system+user message)
+  // and apply 20% buffer to match actual x402 payment (see estimateAmount())
   if (routingDecision) {
+    // Use full body length for accurate cost (matches x402 payment estimation)
+    const estimatedInputTokens = Math.ceil(body.length / 4);
+    const accurateCosts = calculateModelCost(
+      routingDecision.model,
+      routerOpts.modelPricing,
+      estimatedInputTokens,
+      maxTokens,
+      routingProfile ?? undefined,
+    );
+    // Apply 20% buffer to match x402 pre-auth
+    const costWithBuffer = accurateCosts.costEstimate * 1.2;
+    const baselineWithBuffer = accurateCosts.baselineCost * 1.2;
     const entry: UsageEntry = {
       timestamp: new Date().toISOString(),
       model: routingDecision.model,
       tier: routingDecision.tier,
-      cost: routingDecision.costEstimate,
-      baselineCost: routingDecision.baselineCost,
-      savings: routingDecision.savings,
+      cost: costWithBuffer,
+      baselineCost: baselineWithBuffer,
+      savings: accurateCosts.savings,
       latencyMs: Date.now() - startTime,
     };
     logUsage(entry).catch(() => {});

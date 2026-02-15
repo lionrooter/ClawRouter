@@ -9,23 +9,28 @@ One wallet, 30+ models, zero API keys.
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue.svg)](https://typescriptlang.org)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen.svg)](https://nodejs.org)
+[![USDC Hackathon Winner](https://img.shields.io/badge/🏆_USDC_Hackathon-Agentic_Commerce_Winner-gold)](https://x.com/USDC/status/2021625822294216977)
 
-[Docs](https://blockrun.ai/docs) &middot; [Models](https://blockrun.ai/models) &middot; [Configuration](docs/configuration.md) &middot; [Features](docs/features.md) &middot; [Troubleshooting](docs/troubleshooting.md) &middot; [Telegram](https://t.me/blockrunAI) &middot; [X](https://x.com/BlockRunAI)
+[Docs](https://blockrun.ai/docs) &middot; [Models](https://blockrun.ai/models) &middot; [vs OpenRouter](docs/vs-openrouter.md) &middot; [Configuration](docs/configuration.md) &middot; [Features](docs/features.md) &middot; [Troubleshooting](docs/troubleshooting.md) &middot; [Telegram](https://t.me/blockrunAI) &middot; [X](https://x.com/BlockRunAI)
+
+**Winner — Agentic Commerce Track** at the [USDC AI Agent Hackathon](https://x.com/USDC/status/2021625822294216977)<br>
+_The world's first hackathon run entirely by AI agents, powered by USDC_
 
 </div>
 
 ---
 
 ```
-"What is 2+2?"            → DeepSeek        $0.27/M    saved 99%
-"Summarize this article"  → GPT-4o-mini     $0.60/M    saved 99%
-"Build a React component" → Claude Sonnet   $15.00/M   best balance
-"Prove this theorem"      → DeepSeek-R      $0.42/M    reasoning
+"What is 2+2?"            → NVIDIA Kimi     $0.001/M   saved ~100%
+"Summarize this article"  → Grok Code Fast  $1.50/M    saved 94%
+"Build a React component" → Gemini 2.5 Pro  $10.00/M   best balance
+"Prove this theorem"      → Grok 4.1 Fast   $0.50/M    reasoning
 "Run 50 parallel searches"→ Kimi K2.5       $2.40/M    agentic swarm
 ```
 
 ## Why ClawRouter?
 
+- **4 routing profiles** — auto (balanced), eco (95.9-100% savings), premium (best quality), free (zero cost)
 - **100% local routing** — 15-dimension weighted scoring runs on your machine in <1ms
 - **Zero external calls** — no API calls for routing decisions, ever
 - **30+ models** — OpenAI, Anthropic, Google, DeepSeek, xAI, Moonshot through one wallet
@@ -40,26 +45,35 @@ One wallet, 30+ models, zero API keys.
 
 ## Quick Start (2 mins)
 
+**Inspired by Andreas** — we've updated our installation script:
+
 ```bash
 # 1. Install with smart routing enabled by default
-curl -fsSL https://raw.githubusercontent.com/BlockRunAI/ClawRouter/main/scripts/reinstall.sh | bash
+curl -fsSL https://blockrun.ai/ClawRouter-update | bash
+openclaw gateway restart
 
 # 2. Fund your wallet with USDC on Base (address printed on install)
 # $5 is enough for thousands of requests
-
-# 3. Restart OpenClaw gateway
-openclaw gateway restart
 ```
 
 Done! Smart routing (`blockrun/auto`) is now your default model.
 
-### Tips
+### Routing Profiles
 
-- **Use `/model blockrun/auto`** in any conversation to switch on the fly
-- **Free tier?** Use `/model free` — routes to gpt-oss-120b at $0
-- **Model aliases:** `/model sonnet`, `/model grok`, `/model deepseek`, `/model kimi`
-- **Want a specific model?** Use `blockrun/openai/gpt-4o` or `blockrun/anthropic/claude-sonnet-4`
-- **Already have a funded wallet?** `export BLOCKRUN_WALLET_KEY=0x...`
+Choose your routing strategy with `/model <profile>`:
+
+| Profile          | Strategy           | Savings   | Use Case                |
+| ---------------- | ------------------ | --------- | ----------------------- |
+| `/model auto`    | Balanced (default) | 74-100%   | Best overall balance    |
+| `/model eco`     | Cost optimized     | 95.9-100% | Maximum savings         |
+| `/model premium` | Quality focused    | 0%        | Best quality (Opus 4.5) |
+| `/model free`    | Free tier only     | 100%      | Zero cost               |
+
+**Other shortcuts:**
+
+- **Model aliases:** `/model sonnet`, `/model grok`, `/model gpt5`, `/model o3`
+- **Specific models:** `blockrun/openai/gpt-4o` or `blockrun/anthropic/claude-sonnet-4`
+- **Bring your wallet:** `export BLOCKRUN_WALLET_KEY=0x...`
 
 ---
 
@@ -92,18 +106,40 @@ Request → Weighted Scorer (15 dimensions)
               └── Low confidence → Default to MEDIUM tier → Done
 ```
 
-No external classifier calls. Ambiguous queries default to the MEDIUM tier (DeepSeek/GPT-4o-mini) — fast, cheap, and good enough for most tasks.
+No external classifier calls. Ambiguous queries default to the MEDIUM tier (Grok Code Fast) — fast, cheap, and good enough for most tasks.
 
 **Deep dive:** [15-dimension scoring weights](docs/configuration.md#scoring-weights) | [Architecture](docs/architecture.md)
 
+### Routing Profiles (NEW in v0.8.21)
+
+ClawRouter now offers 4 routing profiles to match different priorities:
+
+| Profile            | Strategy                | Savings vs Opus 4.5 | When to Use                   |
+| ------------------ | ----------------------- | ------------------- | ----------------------------- |
+| **auto** (default) | Balanced quality + cost | 74-100%             | General use, best overall     |
+| **eco**            | Maximum cost savings    | 95.9-100%           | Budget-conscious, high volume |
+| **premium**        | Best quality only       | 0%                  | Mission-critical tasks        |
+| **free**           | Free tier only          | 100%                | Testing, empty wallet         |
+
+Switch profiles anytime: `/model eco`, `/model premium`, `/model auto`
+
+**Example:**
+
+```
+/model eco                    # Switch to cost-optimized routing
+"Write a React component"     # Routes to DeepSeek ($0.28/$0.42)
+                              # vs Auto → Grok ($0.20/$1.50)
+                              # 98.3% savings vs Opus 4.5
+```
+
 ### Tier → Model Mapping
 
-| Tier      | Primary Model         | Cost/M | Savings vs Opus |
-| --------- | --------------------- | ------ | --------------- |
-| SIMPLE    | gemini-2.5-flash      | $0.60  | **99.2%**       |
-| MEDIUM    | grok-code-fast-1      | $1.50  | **98.0%**       |
-| COMPLEX   | gemini-2.5-pro        | $10.00 | **86.7%**       |
-| REASONING | grok-4-fast-reasoning | $0.50  | **99.3%**       |
+| Tier      | Primary Model           | Cost/M | Savings vs Opus |
+| --------- | ----------------------- | ------ | --------------- |
+| SIMPLE    | nvidia/kimi-k2.5        | $0.001 | **~100%**       |
+| MEDIUM    | grok-code-fast-1        | $1.50  | **94.0%**       |
+| COMPLEX   | gemini-2.5-pro          | $10.00 | **60.0%**       |
+| REASONING | grok-4-1-fast-reasoning | $0.50  | **98.0%**       |
 
 Special rule: 2+ reasoning markers → REASONING at 0.97 confidence.
 
@@ -117,6 +153,7 @@ ClawRouter v0.5+ includes intelligent features that work automatically:
 - **Model aliases** — `/model free`, `/model sonnet`, `/model grok`
 - **Session persistence** — pins model for multi-turn conversations
 - **Free tier fallback** — keeps working when wallet is empty
+- **Auto-update check** — notifies you when a new version is available
 
 **Full details:** [docs/features.md](docs/features.md)
 
@@ -124,13 +161,13 @@ ClawRouter v0.5+ includes intelligent features that work automatically:
 
 | Tier                | % of Traffic | Cost/M      |
 | ------------------- | ------------ | ----------- |
-| SIMPLE              | ~45%         | $0.27       |
-| MEDIUM              | ~35%         | $0.60       |
-| COMPLEX             | ~15%         | $15.00      |
-| REASONING           | ~5%          | $10.00      |
-| **Blended average** |              | **$3.17/M** |
+| SIMPLE              | ~45%         | $0.001      |
+| MEDIUM              | ~35%         | $1.50       |
+| COMPLEX             | ~15%         | $10.00      |
+| REASONING           | ~5%          | $0.50       |
+| **Blended average** |              | **$2.05/M** |
 
-Compared to **$75/M** for Claude Opus = **96% savings** on a typical workload.
+Compared to **$25/M** for Claude Opus = **92% savings** on a typical workload.
 
 ---
 
@@ -304,8 +341,24 @@ They're built for developers. ClawRouter is built for **agents**.
 | **Auth**    | API key (shared secret)     | Wallet signature (cryptographic) |
 | **Payment** | Prepaid balance (custodial) | Per-request (non-custodial)      |
 | **Routing** | Proprietary / closed        | Open source, client-side         |
+| **Rate limits** | Per-key quotas          | None (your wallet, your limits)  |
+| **Cost**    | $25/M (Opus equivalent)     | $2.05/M blended average          |
 
 Agents shouldn't need a human to paste API keys. They should generate a wallet, receive funds, and pay per request — programmatically.
+
+### Real Problems with OpenRouter
+
+Based on [50+ OpenClaw issues](https://github.com/openclaw/openclaw/issues?q=openrouter):
+
+| Issue | Problem | ClawRouter |
+|-------|---------|------------|
+| [#11202](https://github.com/openclaw/openclaw/issues/11202) | API keys leaked in every LLM prompt | No API keys to leak |
+| [#2373](https://github.com/openclaw/openclaw/issues/2373) | `openrouter/auto` path broken | `blockrun/auto` just works |
+| [#8615](https://github.com/openclaw/openclaw/issues/8615) | Single API key rate limit hell | Non-custodial, no limits |
+| [#2963](https://github.com/openclaw/openclaw/issues/2963) | Tool calling fails silently | Full tool support |
+| [#10687](https://github.com/openclaw/openclaw/issues/10687) | "Unknown model" errors | 30+ models, auto-update |
+
+**[Full comparison →](docs/vs-openrouter.md)**
 
 ---
 
@@ -314,12 +367,18 @@ Agents shouldn't need a human to paste API keys. They should generate a wallet, 
 Quick checklist:
 
 ```bash
-# Check version (should be 0.5.7+)
+# Check version (should be 0.8.21+)
 cat ~/.openclaw/extensions/clawrouter/package.json | grep version
 
 # Check proxy running
 curl http://localhost:8402/health
+
+# Update to latest version
+curl -fsSL https://blockrun.ai/ClawRouter-update | bash
+openclaw gateway restart
 ```
+
+ClawRouter automatically checks for updates on startup and shows a notification if a newer version is available.
 
 **Full guide:** [docs/troubleshooting.md](docs/troubleshooting.md)
 
@@ -340,6 +399,17 @@ BLOCKRUN_WALLET_KEY=0x... npx tsx test-e2e.ts
 
 ---
 
+## Uninstall
+
+```bash
+openclaw plugins uninstall clawrouter
+openclaw gateway restart
+```
+
+Your wallet key remains at `~/.openclaw/blockrun/wallet.key` — back it up before deleting if you have funds.
+
+---
+
 ## Roadmap
 
 - [x] Smart routing — 15-dimension weighted scoring, 4-tier model selection
@@ -354,6 +424,7 @@ BLOCKRUN_WALLET_KEY=0x... npx tsx test-e2e.ts
 - [x] Cost tracking — /stats command with savings dashboard
 - [x] Model aliases — `/model free`, `/model sonnet`, `/model grok`, etc.
 - [x] Free tier — gpt-oss-120b for $0 when wallet is empty
+- [x] Auto-update — startup version check with one-command update
 - [ ] Cascade routing — try cheap model first, escalate on low quality
 - [ ] Spend controls — daily/monthly budgets
 - [ ] Remote analytics — cost tracking at blockrun.ai

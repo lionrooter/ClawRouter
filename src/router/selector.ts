@@ -24,24 +24,34 @@ export function selectModel(
   modelPricing: Map<string, ModelPricing>,
   estimatedInputTokens: number,
   maxOutputTokens: number,
+  routingProfile?: "free" | "eco" | "auto" | "premium",
 ): RoutingDecision {
   const tierConfig = tierConfigs[tier];
   const model = tierConfig.primary;
   const pricing = modelPricing.get(model);
 
-  const inputCost = pricing ? (estimatedInputTokens / 1_000_000) * pricing.inputPrice : 0;
-  const outputCost = pricing ? (maxOutputTokens / 1_000_000) * pricing.outputPrice : 0;
+  // Defensive: guard against undefined price fields (not just undefined pricing)
+  const inputPrice = pricing?.inputPrice ?? 0;
+  const outputPrice = pricing?.outputPrice ?? 0;
+  const inputCost = (estimatedInputTokens / 1_000_000) * inputPrice;
+  const outputCost = (maxOutputTokens / 1_000_000) * outputPrice;
   const costEstimate = inputCost + outputCost;
 
-  // Baseline: what Claude Opus would cost (the premium default)
-  const opusPricing = modelPricing.get("anthropic/claude-opus-4");
-  const baselineInput = opusPricing
-    ? (estimatedInputTokens / 1_000_000) * opusPricing.inputPrice
-    : 0;
-  const baselineOutput = opusPricing ? (maxOutputTokens / 1_000_000) * opusPricing.outputPrice : 0;
+  // Baseline: what Claude Opus 4.5 would cost (the premium reference)
+  const opusPricing = modelPricing.get("anthropic/claude-opus-4.5");
+  const opusInputPrice = opusPricing?.inputPrice ?? 0;
+  const opusOutputPrice = opusPricing?.outputPrice ?? 0;
+  const baselineInput = (estimatedInputTokens / 1_000_000) * opusInputPrice;
+  const baselineOutput = (maxOutputTokens / 1_000_000) * opusOutputPrice;
   const baselineCost = baselineInput + baselineOutput;
 
-  const savings = baselineCost > 0 ? Math.max(0, (baselineCost - costEstimate) / baselineCost) : 0;
+  // Premium profile doesn't calculate savings (it's about quality, not cost)
+  const savings =
+    routingProfile === "premium"
+      ? 0
+      : baselineCost > 0
+        ? Math.max(0, (baselineCost - costEstimate) / baselineCost)
+        : 0;
 
   return {
     model,
@@ -61,6 +71,45 @@ export function selectModel(
 export function getFallbackChain(tier: Tier, tierConfigs: Record<Tier, TierConfig>): string[] {
   const config = tierConfigs[tier];
   return [config.primary, ...config.fallback];
+}
+
+/**
+ * Calculate cost for a specific model (used when fallback model is used).
+ * Returns updated cost fields for RoutingDecision.
+ */
+export function calculateModelCost(
+  model: string,
+  modelPricing: Map<string, ModelPricing>,
+  estimatedInputTokens: number,
+  maxOutputTokens: number,
+  routingProfile?: "free" | "eco" | "auto" | "premium",
+): { costEstimate: number; baselineCost: number; savings: number } {
+  const pricing = modelPricing.get(model);
+
+  // Defensive: guard against undefined price fields (not just undefined pricing)
+  const inputPrice = pricing?.inputPrice ?? 0;
+  const outputPrice = pricing?.outputPrice ?? 0;
+  const inputCost = (estimatedInputTokens / 1_000_000) * inputPrice;
+  const outputCost = (maxOutputTokens / 1_000_000) * outputPrice;
+  const costEstimate = inputCost + outputCost;
+
+  // Baseline: what Claude Opus 4.5 would cost (the premium reference)
+  const opusPricing = modelPricing.get("anthropic/claude-opus-4.5");
+  const opusInputPrice = opusPricing?.inputPrice ?? 0;
+  const opusOutputPrice = opusPricing?.outputPrice ?? 0;
+  const baselineInput = (estimatedInputTokens / 1_000_000) * opusInputPrice;
+  const baselineOutput = (maxOutputTokens / 1_000_000) * opusOutputPrice;
+  const baselineCost = baselineInput + baselineOutput;
+
+  // Premium profile doesn't calculate savings (it's about quality, not cost)
+  const savings =
+    routingProfile === "premium"
+      ? 0
+      : baselineCost > 0
+        ? Math.max(0, (baselineCost - costEstimate) / baselineCost)
+        : 0;
+
+  return { costEstimate, baselineCost, savings };
 }
 
 /**

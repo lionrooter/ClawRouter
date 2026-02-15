@@ -9,6 +9,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { UsageEntry } from "./logger.js";
+import { VERSION } from "./version.js";
 
 const LOG_DIR = join(homedir(), ".openclaw", "blockrun", "logs");
 
@@ -35,6 +36,7 @@ export type AggregatedStats = {
   byTier: Record<string, { count: number; cost: number; percentage: number }>;
   byModel: Record<string, { count: number; cost: number; percentage: number }>;
   dailyBreakdown: DailyStats[];
+  entriesWithBaseline: number; // Entries with valid baseline tracking
 };
 
 /**
@@ -182,6 +184,14 @@ export async function getStats(days: number = 7): Promise<AggregatedStats> {
   const totalSavings = totalBaselineCost - totalCost;
   const savingsPercentage = totalBaselineCost > 0 ? (totalSavings / totalBaselineCost) * 100 : 0;
 
+  // Count entries with valid baseline tracking (baseline != cost means tracking was active)
+  let entriesWithBaseline = 0;
+  for (const day of dailyBreakdown) {
+    if (day.totalBaselineCost !== day.totalCost) {
+      entriesWithBaseline += day.totalRequests;
+    }
+  }
+
   return {
     period: days === 1 ? "today" : `last ${days} days`,
     totalRequests,
@@ -194,6 +204,7 @@ export async function getStats(days: number = 7): Promise<AggregatedStats> {
     byTier: byTierWithPercentage,
     byModel: byModelWithPercentage,
     dailyBreakdown: dailyBreakdown.reverse(), // Oldest first for charts
+    entriesWithBaseline, // How many entries have valid baseline tracking
   };
 }
 
@@ -205,31 +216,43 @@ export function formatStatsAscii(stats: AggregatedStats): string {
 
   // Header
   lines.push("╔════════════════════════════════════════════════════════════╗");
-  lines.push("║              ClawRouter Usage Statistics                   ║");
+  lines.push(`║          ClawRouter by BlockRun v${VERSION}`.padEnd(61) + "║");
+  lines.push("║                Usage Statistics                            ║");
   lines.push("╠════════════════════════════════════════════════════════════╣");
 
   // Summary
   lines.push(`║  Period: ${stats.period.padEnd(49)}║`);
   lines.push(`║  Total Requests: ${stats.totalRequests.toString().padEnd(41)}║`);
   lines.push(`║  Total Cost: $${stats.totalCost.toFixed(4).padEnd(43)}║`);
-  lines.push(`║  Baseline Cost (Opus): $${stats.totalBaselineCost.toFixed(4).padEnd(33)}║`);
-  lines.push(
-    `║  💰 Total Saved: $${stats.totalSavings.toFixed(4)} (${stats.savingsPercentage.toFixed(1)}%)`.padEnd(
-      61,
-    ) + "║",
-  );
+  lines.push(`║  Baseline Cost (Opus 4.5): $${stats.totalBaselineCost.toFixed(4).padEnd(30)}║`);
+
+  // Show savings with note if some entries lack baseline tracking
+  const savingsLine = `║  💰 Total Saved: $${stats.totalSavings.toFixed(4)} (${stats.savingsPercentage.toFixed(1)}%)`;
+  if (stats.entriesWithBaseline < stats.totalRequests && stats.entriesWithBaseline > 0) {
+    lines.push(savingsLine.padEnd(61) + "║");
+    const note = `║     (based on ${stats.entriesWithBaseline}/${stats.totalRequests} tracked requests)`;
+    lines.push(note.padEnd(61) + "║");
+  } else {
+    lines.push(savingsLine.padEnd(61) + "║");
+  }
   lines.push(`║  Avg Latency: ${stats.avgLatencyMs.toFixed(0)}ms`.padEnd(61) + "║");
 
   // Tier breakdown
   lines.push("╠════════════════════════════════════════════════════════════╣");
   lines.push("║  Routing by Tier:                                          ║");
 
-  const tierOrder = ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"];
+  // Show all tiers found in data, ordered by known tiers first then others
+  const knownTiers = ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"];
+  const allTiers = Object.keys(stats.byTier);
+  const otherTiers = allTiers.filter((t) => !knownTiers.includes(t));
+  const tierOrder = [...knownTiers.filter((t) => stats.byTier[t]), ...otherTiers];
+
   for (const tier of tierOrder) {
     const data = stats.byTier[tier];
     if (data) {
       const bar = "█".repeat(Math.min(20, Math.round(data.percentage / 5)));
-      const line = `║    ${tier.padEnd(10)} ${bar.padEnd(20)} ${data.percentage.toFixed(1).padStart(5)}% (${data.count})`;
+      const displayTier = tier === "UNKNOWN" ? "OTHER" : tier;
+      const line = `║    ${displayTier.padEnd(10)} ${bar.padEnd(20)} ${data.percentage.toFixed(1).padStart(5)}% (${data.count})`;
       lines.push(line.padEnd(61) + "║");
     }
   }
