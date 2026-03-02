@@ -39,9 +39,10 @@ import {
 const WALLET_DIR = join(homedir(), ".openclaw", "blockrun");
 const WALLET_FILE = join(WALLET_DIR, "wallet.key");
 const MNEMONIC_FILE = join(WALLET_DIR, "mnemonic");
+const CHAIN_FILE = join(WALLET_DIR, "payment-chain");
 
 // Export for use by wallet command and index.ts
-export { WALLET_FILE, MNEMONIC_FILE };
+export { WALLET_FILE, MNEMONIC_FILE, CHAIN_FILE };
 
 /**
  * Try to load a previously auto-generated wallet key from disk.
@@ -89,46 +90,21 @@ async function loadSavedWallet(): Promise<string | undefined> {
 
 /**
  * Load mnemonic from disk if it exists.
- * Like loadSavedWallet(), refuses to silently ignore a corrupt mnemonic file
- * to protect Solana funds derived from it.
+ * Warns on corruption but never throws — callers handle missing mnemonic gracefully.
  */
-async function loadMnemonic(options?: { strict?: boolean }): Promise<string | undefined> {
-  const strict = options?.strict ?? false;
+async function loadMnemonic(): Promise<string | undefined> {
   try {
     const mnemonic = (await readTextFile(MNEMONIC_FILE)).trim();
     if (mnemonic && isValidMnemonic(mnemonic)) {
       return mnemonic;
     }
-    // File exists but content is invalid.
-    if (strict) {
-      // Solana path: refuse to ignore — funds may be derived from this mnemonic.
-      console.error(`[ClawRouter] ✗ CRITICAL: Mnemonic file exists but has invalid format!`);
-      console.error(`[ClawRouter]   File: ${MNEMONIC_FILE}`);
-      console.error(`[ClawRouter]   To fix: restore your mnemonic backup or delete the file to start fresh`);
-      throw new Error(
-        `Mnemonic file at ${MNEMONIC_FILE} is corrupted or has wrong format. ` +
-        `Refusing to ignore it to protect Solana funds derived from this mnemonic. ` +
-        `Restore your mnemonic backup or delete the file if no Solana funds are at risk.`,
-      );
-    }
-    // Base path: warn but continue — mnemonic is not critical for EVM-only usage.
-    console.warn(`[ClawRouter] ⚠ Mnemonic file exists but has invalid format — ignoring (Base-only mode)`);
+    // File exists but content is invalid — warn but continue.
+    console.warn(`[ClawRouter] ⚠ Mnemonic file exists but has invalid format — ignoring`);
     return undefined;
   } catch (err) {
-    // Re-throw corruption errors from strict mode
-    if (err instanceof Error && err.message.includes("Refusing to ignore")) {
-      throw err;
-    }
     // Only swallow ENOENT (file not found)
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      if (strict) {
-        throw new Error(
-          `Cannot read mnemonic file at ${MNEMONIC_FILE}: ${err instanceof Error ? err.message : String(err)}. ` +
-          `Refusing to ignore it to protect Solana funds. ` +
-          `Fix file permissions or delete the file if no Solana funds are at risk.`,
-        );
-      }
-      console.warn(`[ClawRouter] ⚠ Cannot read mnemonic file — ignoring (Base-only mode)`);
+      console.warn(`[ClawRouter] ⚠ Cannot read mnemonic file — ignoring`);
     }
   }
   return undefined;
@@ -155,7 +131,7 @@ async function generateAndSaveWallet(): Promise<{
 }> {
   // Safety: if a mnemonic file already exists, a Solana wallet was derived from it.
   // Generating a new wallet would overwrite the mnemonic and lose Solana funds.
-  const existingMnemonic = await loadMnemonic({ strict: true });
+  const existingMnemonic = await loadMnemonic();
   if (existingMnemonic) {
     throw new Error(
       `Mnemonic file exists at ${MNEMONIC_FILE} but wallet.key is missing. ` +
@@ -230,33 +206,14 @@ export type WalletResolution = {
   solanaPrivateKeyBytes?: Uint8Array;
 };
 
-export async function resolveOrGenerateWalletKey(options?: {
-  paymentChain?: "base" | "solana";
-}): Promise<WalletResolution> {
-  const wantSolana = options?.paymentChain === "solana";
-
+export async function resolveOrGenerateWalletKey(): Promise<WalletResolution> {
   // 1. Previously saved wallet
   const saved = await loadSavedWallet();
   if (saved) {
     const account = privateKeyToAccount(saved as `0x${string}`);
 
-    // Check if mnemonic exists (Solana support enabled)
-    let mnemonic = await loadMnemonic({ strict: wantSolana });
-
-    // Auto-setup Solana if user opted in but no mnemonic exists yet
-    if (!mnemonic && wantSolana) {
-      console.log(`[ClawRouter] Solana payment chain selected — setting up Solana wallet...`);
-      const solanaResult = await setupSolana();
-      mnemonic = solanaResult.mnemonic;
-      return {
-        key: saved,
-        address: account.address,
-        source: "saved",
-        mnemonic,
-        solanaPrivateKeyBytes: solanaResult.solanaPrivateKeyBytes,
-      };
-    }
-
+    // Load mnemonic if it exists (Solana support enabled via /wallet solana)
+    const mnemonic = await loadMnemonic();
     if (mnemonic) {
       const solanaKeyBytes = deriveSolanaKeyBytes(mnemonic);
       return {
@@ -276,30 +233,8 @@ export async function resolveOrGenerateWalletKey(options?: {
   if (typeof envKey === "string" && envKey.startsWith("0x") && envKey.length === 66) {
     const account = privateKeyToAccount(envKey as `0x${string}`);
 
-    // Check if mnemonic exists (Solana support enabled) — same as "saved" path
-    let mnemonic = await loadMnemonic({ strict: wantSolana });
-
-    // Auto-setup Solana if user opted in but no mnemonic exists yet
-    // Note: env-var users need a saved wallet.key for setupSolana(), so we skip if not present
-    if (!mnemonic && wantSolana) {
-      console.log(`[ClawRouter] Solana payment chain selected — setting up Solana wallet...`);
-      // Save the env key to disk first so setupSolana() can find it.
-      // WARNING: This persists the env-provided key to disk, which changes the security model
-      // for users who expect keys to live only in environment variables.
-      console.warn(`[ClawRouter] ⚠ Writing wallet key to ${WALLET_FILE} (required for Solana key derivation)`);
-      await mkdir(WALLET_DIR, { recursive: true });
-      await writeFile(WALLET_FILE, envKey + "\n", { mode: 0o600 });
-      const solanaResult = await setupSolana();
-      mnemonic = solanaResult.mnemonic;
-      return {
-        key: envKey,
-        address: account.address,
-        source: "env",
-        mnemonic,
-        solanaPrivateKeyBytes: solanaResult.solanaPrivateKeyBytes,
-      };
-    }
-
+    // Load mnemonic if it exists (Solana support enabled via /wallet solana)
+    const mnemonic = await loadMnemonic();
     if (mnemonic) {
       const solanaKeyBytes = deriveSolanaKeyBytes(mnemonic);
       return {
@@ -335,7 +270,7 @@ export async function setupSolana(): Promise<{
   solanaPrivateKeyBytes: Uint8Array;
 }> {
   // Safety: mnemonic must not already exist
-  const existing = await loadMnemonic({ strict: true });
+  const existing = await loadMnemonic();
   if (existing) {
     throw new Error(
       "Solana wallet already set up. Mnemonic file exists at " + MNEMONIC_FILE,
@@ -362,6 +297,37 @@ export async function setupSolana(): Promise<{
   console.log(`[ClawRouter] Existing EVM wallet unchanged.`);
 
   return { mnemonic, solanaPrivateKeyBytes: solanaKeyBytes };
+}
+
+/**
+ * Persist the user's payment chain selection to disk.
+ */
+export async function savePaymentChain(chain: "base" | "solana"): Promise<void> {
+  await mkdir(WALLET_DIR, { recursive: true });
+  await writeFile(CHAIN_FILE, chain + "\n", { mode: 0o600 });
+}
+
+/**
+ * Load the persisted payment chain selection from disk.
+ * Returns "base" if no file exists or the file is invalid.
+ */
+export async function loadPaymentChain(): Promise<"base" | "solana"> {
+  try {
+    const content = (await readTextFile(CHAIN_FILE)).trim();
+    if (content === "solana") return "solana";
+    return "base";
+  } catch {
+    return "base";
+  }
+}
+
+/**
+ * Resolve payment chain: env var first → persisted file second → default "base".
+ */
+export async function resolvePaymentChain(): Promise<"base" | "solana"> {
+  if (process["env"].CLAWROUTER_PAYMENT_CHAIN === "solana") return "solana";
+  if (process["env"].CLAWROUTER_PAYMENT_CHAIN === "base") return "base";
+  return loadPaymentChain();
 }
 
 /**

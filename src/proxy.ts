@@ -58,6 +58,7 @@ import { getStats } from "./stats.js";
 import { RequestDeduplicator } from "./dedup.js";
 import { ResponseCache, type ResponseCacheConfig } from "./response-cache.js";
 import { BalanceMonitor } from "./balance.js";
+import { resolvePaymentChain } from "./auth.js";
 import { compressContext, shouldCompress, type NormalizedMessage } from "./compression/index.js";
 // Error classes available for programmatic use but not used in proxy
 // (universal free fallback means we don't throw balance errors anymore)
@@ -1109,13 +1110,12 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   const solanaPrivateKeyBytes =
     typeof options.wallet === "string" ? undefined : options.wallet.solanaPrivateKeyBytes;
 
-  // Payment chain: default to Base (EVM), user can opt-in to Solana via env var or options.
-  // No dynamic switching — user manually selects chain.
-  // Solana wallet auto-setup is handled by resolveOrGenerateWalletKey() before startProxy is called.
-  const paymentChain = options.paymentChain ?? (process["env"].CLAWROUTER_PAYMENT_CHAIN === "solana" ? "solana" : "base");
+  // Payment chain: options > env var > persisted file > default "base".
+  // No dynamic switching — user selects chain via /wallet solana or /wallet base.
+  const paymentChain = options.paymentChain ?? await resolvePaymentChain();
   const apiBase = options.apiBase ?? (paymentChain === "solana" && solanaPrivateKeyBytes ? BLOCKRUN_SOLANA_API : BLOCKRUN_API);
   if (paymentChain === "solana" && !solanaPrivateKeyBytes) {
-    console.warn(`[ClawRouter] CLAWROUTER_PAYMENT_CHAIN=solana but no Solana keys provided. Using Base (EVM).`);
+    console.warn(`[ClawRouter] Payment chain is Solana but no Solana keys provided. Using Base (EVM).`);
   } else if (paymentChain === "solana") {
     console.log(`[ClawRouter] Payment chain: Solana (${BLOCKRUN_SOLANA_API})`);
   }

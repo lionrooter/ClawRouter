@@ -25,7 +25,7 @@ import type {
 } from "./types.js";
 import { blockrunProvider, setActiveProxy } from "./provider.js";
 import { startProxy, getProxyPort } from "./proxy.js";
-import { resolveOrGenerateWalletKey, setupSolana, WALLET_FILE, MNEMONIC_FILE } from "./auth.js";
+import { resolveOrGenerateWalletKey, setupSolana, savePaymentChain, resolvePaymentChain, WALLET_FILE, MNEMONIC_FILE } from "./auth.js";
 import type { RoutingConfig } from "./router/index.js";
 import { BalanceMonitor } from "./balance.js";
 
@@ -417,8 +417,7 @@ let activeProxyHandle: Awaited<ReturnType<typeof startProxy>> | null = null;
  */
 async function startProxyInBackground(api: OpenClawPluginApi): Promise<void> {
   // Resolve wallet key: saved file → env var → auto-generate
-  const paymentChain = process["env"].CLAWROUTER_PAYMENT_CHAIN === "solana" ? "solana" as const : "base" as const;
-  const wallet = await resolveOrGenerateWalletKey({ paymentChain });
+  const wallet = await resolveOrGenerateWalletKey();
 
   // Log wallet source
   if (wallet.source === "generated") {
@@ -618,11 +617,37 @@ async function createWalletCommand(): Promise<OpenClawPluginCommandDefinition> {
         return { text: lines.join("\n") };
       }
 
-      if (subcommand === "setup-solana") {
-        // Set up Solana wallet for existing EVM-only users
+      if (subcommand === "solana") {
+        // Switch to Solana chain. If mnemonic already exists, just persist the selection.
+        // If no mnemonic, set up Solana wallet first.
         try {
+          let solanaAddr: string | undefined;
+
+          // Check if Solana wallet is already set up (mnemonic exists)
+          if (existsSync(MNEMONIC_FILE)) {
+            const existingMnemonic = readTextFileSync(MNEMONIC_FILE).trim();
+            if (existingMnemonic) {
+              // Already set up — just switch chain
+              await savePaymentChain("solana");
+              const { deriveSolanaKeyBytes } = await import("./wallet.js");
+              const solKeyBytes = deriveSolanaKeyBytes(existingMnemonic);
+              const { createKeyPairSignerFromPrivateKeyBytes } = await import("@solana/kit");
+              const signer = await createKeyPairSignerFromPrivateKeyBytes(solKeyBytes);
+              solanaAddr = signer.address;
+              return {
+                text: [
+                  "Payment chain set to Solana. Restart the gateway to apply.",
+                  "",
+                  `**Solana Address:** \`${solanaAddr}\``,
+                  `**Fund with USDC on Solana:** https://solscan.io/account/${solanaAddr}`,
+                ].join("\n"),
+              };
+            }
+          }
+
+          // No mnemonic — first-time Solana setup
           const { solanaPrivateKeyBytes } = await setupSolana();
-          // Derive Solana address for display
+          await savePaymentChain("solana");
           const { createKeyPairSignerFromPrivateKeyBytes } = await import("@solana/kit");
           const signer = await createKeyPairSignerFromPrivateKeyBytes(solanaPrivateKeyBytes);
           return {
@@ -633,7 +658,7 @@ async function createWalletCommand(): Promise<OpenClawPluginCommandDefinition> {
               `**Mnemonic File:** \`${MNEMONIC_FILE}\``,
               "",
               "Your existing EVM wallet is unchanged.",
-              "Restart the gateway to enable Solana payments.",
+              "Payment chain set to Solana. Restart the gateway to apply.",
               "",
               `**Fund with USDC on Solana:** https://solscan.io/account/${signer.address}`,
             ].join("\n"),
@@ -641,6 +666,21 @@ async function createWalletCommand(): Promise<OpenClawPluginCommandDefinition> {
         } catch (err) {
           return {
             text: `Failed to set up Solana: ${err instanceof Error ? err.message : String(err)}`,
+            isError: true,
+          };
+        }
+      }
+
+      if (subcommand === "base") {
+        // Switch back to Base (EVM) payment chain
+        try {
+          await savePaymentChain("base");
+          return {
+            text: "Payment chain set to Base (EVM). Restart the gateway to apply.",
+          };
+        } catch (err) {
+          return {
+            text: `Failed to set payment chain: ${err instanceof Error ? err.message : String(err)}`,
             isError: true,
           };
         }
@@ -691,9 +731,14 @@ async function createWalletCommand(): Promise<OpenClawPluginCommandDefinition> {
         // No Solana wallet - that's fine
       }
 
+      // Show current chain selection
+      const currentChain = await resolvePaymentChain();
+
       return {
         text: [
           "**ClawRouter Wallet**",
+          "",
+          `**Payment Chain:** ${currentChain === "solana" ? "Solana" : "Base (EVM)"}`,
           "",
           "**Base (EVM):**",
           `  Address: \`${address}\``,
@@ -706,7 +751,9 @@ async function createWalletCommand(): Promise<OpenClawPluginCommandDefinition> {
           "**Commands:**",
           "• `/wallet` - Show this status",
           "• `/wallet export` - Export private key for backup",
-          !solanaSection ? "• `/wallet setup-solana` - Enable Solana payments" : "",
+          !solanaSection ? "• `/wallet solana` - Enable Solana payments" : "",
+          solanaSection ? "• `/wallet base` - Switch to Base (EVM)" : "",
+          solanaSection ? "• `/wallet solana` - Switch to Solana" : "",
         ].filter(Boolean).join("\n"),
       };
     },
@@ -864,7 +911,7 @@ const plugin: OpenClawPluginDefinition = {
     if (!isGatewayMode()) {
       // Generate wallet on first install (even outside gateway mode)
       // This ensures users can see their wallet address immediately after install
-      resolveOrGenerateWalletKey({ paymentChain: process["env"].CLAWROUTER_PAYMENT_CHAIN === "solana" ? "solana" : "base" })
+      resolveOrGenerateWalletKey()
         .then(({ address, source }) => {
           if (source === "generated") {
             api.logger.warn(`════════════════════════════════════════════════`);
@@ -965,7 +1012,7 @@ export {
   deriveAllKeys,
 } from "./wallet.js";
 export type { DerivedKeys } from "./wallet.js";
-export { setupSolana } from "./auth.js";
+export { setupSolana, savePaymentChain, loadPaymentChain, resolvePaymentChain } from "./auth.js";
 export {
   InsufficientFundsError,
   EmptyWalletError,
