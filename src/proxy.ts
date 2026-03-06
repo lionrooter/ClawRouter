@@ -338,6 +338,9 @@ const PROVIDER_ERROR_PATTERNS = [
   /credits/i,
   /quota.*exceeded/i,
   /rate.*limit/i,
+  /you\s*have\s*hit\s*your\s*limit/i,
+  /you['’]ve\s*hit\s*your\s*limit/i,
+  /rate\s*limited/i,
   /model.*unavailable/i,
   /model.*not.*available/i,
   /service.*unavailable/i,
@@ -346,12 +349,28 @@ const PROVIDER_ERROR_PATTERNS = [
   /temporarily.*unavailable/i,
   /api.*key.*invalid/i,
   /authentication.*failed/i,
+  /oauth/i,
+  /auth.*failed/i,
   /request too large/i,
   /request.*size.*exceeds/i,
   /payload too large/i,
   /payment.*verification.*failed/i,
   /model.*not.*allowed/i,
-  /unknown.*model/i,
+  /too many requests/i,
+];
+
+/**
+ * Patterns that indicate client request bugs and should stop fallback.
+ */
+const CLIENT_BUG_PATTERNS = [
+  /messages\s+must\s+be/i,
+  /invalid\s+request/i,
+  /unknown\s+parameter/i,
+  /failed\s+to\s+parse/i,
+  /invalid\s+json/i,
+  /model\s+not\s+found/i,
+  /unknown\s+model/i,
+  /invalid\s+model/i,
 ];
 
 /**
@@ -362,6 +381,9 @@ const DEGRADED_RESPONSE_PATTERNS = [
   /the ai service is temporarily overloaded/i,
   /service is temporarily overloaded/i,
   /please try again in a moment/i,
+  /you\s*have\s*hit\s*your\s*limit/i,
+  /you['’]ve\s*hit\s*your\s*limit/i,
+  /you\s*have\s*been\s*rate\s*limited/i,
 ];
 
 /**
@@ -373,6 +395,248 @@ const DEGRADED_LOOP_PATTERNS = [
   /the final answer is the boxed\./i,
 ];
 
+const RATE_LIMIT_PATTERNS = [
+  /rate\s*limit/i,
+  /too\s*many\s*requests/i,
+  /you\s*have\s*hit\s*your\s*limit/i,
+  /you['’]ve\s*hit\s*your\s*limit/i,
+  /hit\s*your\s*limit/i,
+];
+const BILLING_PATTERNS = [/billing/i, /credits/i, /insufficient.*balance/i, /quota/i, /payment/i];
+const AUTH_PATTERNS = [/invalid\s+api\s+key/i, /oauth/i, /auth/i, /unauthorized/i, /forbidden/i, /expired/i];
+const OUTAGE_PATTERNS = [/service\s+unavailable/i, /temporarily\s+unavailable/i, /overloaded/i, /capacity/i];
+
+type UpstreamError = {
+  message: string;
+  type?: string;
+};
+
+type ProviderFailureClassification = {
+  isProviderError: boolean;
+  isClientBug: boolean;
+  isRateLimited: boolean;
+  reason: string;
+  error?: UpstreamError;
+};
+
+function anyPatternMatch(message: string, patterns: RegExp[]): boolean {
+  return patterns.some((pattern) => pattern.test(message));
+}
+
+function looksLikeSse(body: string): boolean {
+  return /(^|\n)\s*data:\s*/m.test(body);
+}
+
+function parseSsePayloads(body: string): unknown[] {
+  const events: unknown[] = [];
+  const normalized = body.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+
+  for (const line of lines) {
+    const match = line.match(/^\s*data:\s*(.*)$/);
+    if (!match) continue;
+
+    const data = match[1]?.trim();
+    if (!data || data === "[DONE]") continue;
+
+    try {
+      events.push(JSON.parse(data));
+    } catch {
+      // Ignore non-JSON SSE payloads
+    }
+  }
+
+  return events;
+}
+
+function extractUpstreamErrorFromPayload(payload: unknown): UpstreamError | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+
+  const obj = payload as Record<string, unknown>;
+
+  // Standard OpenAI-style { error: { message, type } }
+  const errorValue = obj.error;
+  if (typeof errorValue === "string") {
+    return { message: errorValue };
+  }
+  if (errorValue && typeof errorValue === "object") {
+    const errorObj = errorValue as Record<string, unknown>;
+    if (typeof errorObj.message === "string") {
+      return {
+        message: errorObj.message,
+        type: typeof errorObj.type === "string" ? errorObj.type : undefined,
+      };
+    }
+  }
+
+  // CLI-style { is_error: true, result: "..." }
+  if (
+    obj.is_error === true &&
+    typeof obj.result === "string" &&
+    obj.result.trim().length > 0
+  ) {
+    return {
+      message: obj.result,
+      type: "proxy_error",
+    };
+  }
+
+  // Alternative error envelope: { type: "error", message: "..." }
+  if (obj.type === "error" && typeof obj.message === "string") {
+    return { message: obj.message, type: "proxy_error" };
+  }
+
+  return undefined;
+}
+
+function extractUpstreamError(body: string): UpstreamError | undefined {
+  if (!body) return undefined;
+
+  if (looksLikeSse(body)) {
+    for (const event of parseSsePayloads(body)) {
+      const error = extractUpstreamErrorFromPayload(event);
+      if (error) return error;
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    return extractUpstreamErrorFromPayload(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
+function classifyProviderFailure(params: {
+  status: number;
+  body: string;
+  contentType?: string | null;
+}): ProviderFailureClassification {
+  const { status, body } = params;
+
+  const normalizedBody = body || "";
+  const upstreamError = extractUpstreamError(normalizedBody);
+  if (upstreamError?.message) {
+    const message = upstreamError.message;
+    const isClientBug = anyPatternMatch(message, CLIENT_BUG_PATTERNS);
+
+    if (status === 200) {
+      return {
+        isProviderError: !isClientBug,
+        isClientBug,
+        isRateLimited: anyPatternMatch(message, RATE_LIMIT_PATTERNS),
+        reason: isClientBug ? "embedded_client_error" : "embedded_provider_error",
+        error: upstreamError,
+      };
+    }
+
+    if (status === 400) {
+      const isProvider =
+        !isClientBug &&
+        (anyPatternMatch(message, PROVIDER_ERROR_PATTERNS) ||
+          anyPatternMatch(message, RATE_LIMIT_PATTERNS) ||
+          anyPatternMatch(message, BILLING_PATTERNS) ||
+          anyPatternMatch(message, AUTH_PATTERNS) ||
+          anyPatternMatch(message, OUTAGE_PATTERNS));
+
+      return {
+        isProviderError: isProvider,
+        isClientBug,
+        isRateLimited: anyPatternMatch(message, RATE_LIMIT_PATTERNS),
+        reason: isProvider ? "400_embedded_provider_error" : "400_embedded_client_error",
+        error: upstreamError,
+      };
+    }
+  }
+
+  // 200 responses can carry provider failures in success envelopes.
+  if (status === 200) {
+    const degraded = detectDegradedSuccessResponse(normalizedBody);
+    if (degraded) {
+      return {
+        isProviderError: true,
+        isClientBug: false,
+        isRateLimited: anyPatternMatch(normalizedBody, RATE_LIMIT_PATTERNS),
+        reason: degraded,
+      };
+    }
+
+    return {
+      isProviderError: false,
+      isClientBug: false,
+      isRateLimited: false,
+      reason: "200_success",
+    };
+  }
+
+  // Non-200 provider status handling
+  if (!FALLBACK_STATUS_CODES.includes(status)) {
+    return {
+      isProviderError: false,
+      isClientBug: false,
+      isRateLimited: false,
+      reason: `status_${status}_non_fallback`,
+    };
+  }
+
+  if (status === 429) {
+    return {
+      isProviderError: true,
+      isClientBug: false,
+      isRateLimited: true,
+      reason: "status_429",
+      error: upstreamError,
+    };
+  }
+
+  if (status === 401 || status === 403 || status === 402) {
+    return {
+      isProviderError: true,
+      isClientBug: false,
+      isRateLimited: false,
+      reason: `status_${status}`,
+      error: upstreamError,
+    };
+  }
+
+  if (status >= 500) {
+    return {
+      isProviderError: true,
+      isClientBug: false,
+      isRateLimited: false,
+      reason: `status_${status}`,
+      error: upstreamError,
+    };
+  }
+
+  // 400 is ambiguous; only fallback when strongly provider-like.
+  if (status === 400) {
+    const providerLike =
+      anyPatternMatch(normalizedBody, PROVIDER_ERROR_PATTERNS) ||
+      anyPatternMatch(normalizedBody, RATE_LIMIT_PATTERNS) ||
+      anyPatternMatch(normalizedBody, BILLING_PATTERNS) ||
+      anyPatternMatch(normalizedBody, AUTH_PATTERNS) ||
+      anyPatternMatch(normalizedBody, OUTAGE_PATTERNS);
+    return {
+      isProviderError: providerLike,
+      isClientBug: !providerLike,
+      isRateLimited: anyPatternMatch(normalizedBody, RATE_LIMIT_PATTERNS),
+      reason: providerLike ? "400_provider_like" : "400_client_like",
+      error: upstreamError,
+    };
+  }
+
+  // Other mapped fallback statuses (413 etc.)
+  const providerLike = anyPatternMatch(normalizedBody, PROVIDER_ERROR_PATTERNS);
+  return {
+    isProviderError: providerLike,
+    isClientBug: false,
+    isRateLimited: false,
+    reason: `status_${status}`,
+    error: upstreamError,
+  };
+}
+
 function extractAssistantContent(payload: unknown): string | undefined {
   if (!payload || typeof payload !== "object") return undefined;
   const record = payload as Record<string, unknown>;
@@ -382,10 +646,27 @@ function extractAssistantContent(payload: unknown): string | undefined {
   const firstChoice = choices[0];
   if (!firstChoice || typeof firstChoice !== "object") return undefined;
   const choice = firstChoice as Record<string, unknown>;
+
   const message = choice.message;
-  if (!message || typeof message !== "object") return undefined;
-  const content = (message as Record<string, unknown>).content;
-  return typeof content === "string" ? content : undefined;
+  if (message && typeof message === "object") {
+    const content = (message as Record<string, unknown>).content;
+    if (typeof content === "string") return content;
+  }
+
+  const delta = choice.delta;
+  if (delta && typeof delta === "object") {
+    const content = (delta as Record<string, unknown>).content;
+    if (typeof content === "string") return content;
+  }
+
+  return undefined;
+}
+
+function isDegradedResponseText(text: string): boolean {
+  return (
+    DEGRADED_RESPONSE_PATTERNS.some((pattern) => pattern.test(text)) ||
+    PROVIDER_ERROR_PATTERNS.some((pattern) => pattern.test(text))
+  );
 }
 
 function hasKnownLoopSignature(text: string): boolean {
@@ -420,9 +701,45 @@ export function detectDegradedSuccessResponse(body: string): string | undefined 
   const trimmed = body.trim();
   if (!trimmed) return undefined;
 
+  if (looksLikeSse(trimmed)) {
+    const parsedEvents = parseSsePayloads(trimmed);
+    const assistantChunks: string[] = [];
+
+    for (const event of parsedEvents) {
+      const eventError = extractUpstreamErrorFromPayload(event);
+      if (eventError?.message &&
+        (PROVIDER_ERROR_PATTERNS.some((pattern) => pattern.test(eventError.message)) ||
+          DEGRADED_RESPONSE_PATTERNS.some((pattern) => pattern.test(eventError.message)))
+      ) {
+        return `degraded response: ${eventError.message.slice(0, 120)}`;
+      }
+
+      const assistantContent = extractAssistantContent(event);
+      if (assistantContent) {
+        assistantChunks.push(assistantContent);
+      }
+    }
+
+    const assistantText = assistantChunks.join("");
+    if (assistantText) {
+      if (isDegradedResponseText(assistantText)) {
+        return "degraded response: degraded assistant content";
+      }
+      if (hasKnownLoopSignature(assistantText)) {
+        return "degraded response: repetitive assistant loop";
+      }
+    }
+
+    // Continue with fallback checks below for non-stream patterns.
+  }
+
   // Plain-text placeholder response.
   if (DEGRADED_RESPONSE_PATTERNS.some((pattern) => pattern.test(trimmed))) {
     return "degraded response: overloaded placeholder";
+  }
+
+  if (PROVIDER_ERROR_PATTERNS.some((pattern) => pattern.test(trimmed))) {
+    return "degraded response: provider error pattern";
   }
 
   // Plain-text looping garbage response.
@@ -434,29 +751,19 @@ export function detectDegradedSuccessResponse(body: string): string | undefined 
     const parsed = JSON.parse(trimmed) as Record<string, unknown>;
 
     // Some providers return JSON error payloads with HTTP 200.
-    const errorField = parsed.error;
-    let errorText = "";
-    if (typeof errorField === "string") {
-      errorText = errorField;
-    } else if (errorField && typeof errorField === "object") {
-      const errObj = errorField as Record<string, unknown>;
-      errorText = [
-        typeof errObj.message === "string" ? errObj.message : "",
-        typeof errObj.type === "string" ? errObj.type : "",
-        typeof errObj.code === "string" ? errObj.code : "",
-      ]
-        .filter(Boolean)
-        .join(" ");
-    }
-    if (errorText && PROVIDER_ERROR_PATTERNS.some((pattern) => pattern.test(errorText))) {
-      return `degraded response: ${errorText.slice(0, 120)}`;
+    const parsedError = extractUpstreamErrorFromPayload(parsed);
+    if (parsedError?.message) {
+      const { message } = parsedError;
+      if (DEGRADED_RESPONSE_PATTERNS.some((pattern) => pattern.test(message))) {
+        return `degraded response: ${message.slice(0, 120)}`;
+      }
     }
 
     // Successful wrapper with bad assistant content.
     const assistantContent = extractAssistantContent(parsed);
     if (!assistantContent) return undefined;
-    if (DEGRADED_RESPONSE_PATTERNS.some((pattern) => pattern.test(assistantContent))) {
-      return "degraded response: overloaded assistant content";
+    if (isDegradedResponseText(assistantContent)) {
+      return "degraded response: degraded assistant content";
     }
     if (hasKnownLoopSignature(assistantContent)) {
       return "degraded response: repetitive assistant loop";
@@ -483,24 +790,6 @@ const FALLBACK_STATUS_CODES = [
   503, // Service unavailable
   504, // Gateway timeout
 ];
-
-/**
- * Check if an error response indicates a provider issue that should trigger fallback.
- */
-function isProviderError(status: number, body: string): boolean {
-  // Check status code first
-  if (!FALLBACK_STATUS_CODES.includes(status)) {
-    return false;
-  }
-
-  // For 5xx errors, always fallback
-  if (status >= 500) {
-    return true;
-  }
-
-  // For 4xx errors, check the body for known provider error patterns
-  return PROVIDER_ERROR_PATTERNS.some((pattern) => pattern.test(body));
-}
 
 /**
  * Valid message roles for OpenAI-compatible APIs.
@@ -1651,6 +1940,7 @@ type ModelRequestResult = {
   errorBody?: string;
   errorStatus?: number;
   isProviderError?: boolean;
+  isRateLimited?: boolean;
 };
 
 /**
@@ -1720,31 +2010,45 @@ async function tryModelRequest(
     });
 
     // Check for provider errors
+    const contentType = response.headers.get("content-type") || "";
     if (response.status !== 200) {
-      // Clone response to read body without consuming it
       const errorBody = await response.text();
-      const isProviderErr = isProviderError(response.status, errorBody);
+      const classification = classifyProviderFailure({
+        status: response.status,
+        body: errorBody,
+        contentType,
+      });
 
       return {
         success: false,
         errorBody,
         errorStatus: response.status,
-        isProviderError: isProviderErr,
+        isProviderError: classification.isProviderError,
+        isRateLimited: classification.isRateLimited,
       };
     }
 
     // Detect provider degradation hidden inside HTTP 200 responses.
-    const contentType = response.headers.get("content-type") || "";
-    if (contentType.includes("json") || contentType.includes("text")) {
+    if (contentType.includes("json") || contentType.includes("text") || contentType.includes("x-ndjson")) {
       try {
         const responseBody = await response.clone().text();
-        const degradedReason = detectDegradedSuccessResponse(responseBody);
-        if (degradedReason) {
+        const classification = classifyProviderFailure({
+          status: response.status,
+          body: responseBody,
+          contentType,
+        });
+
+        if (classification.isProviderError) {
+          const syntheticErrorStatus = classification.isClientBug
+            ? 400
+            : 502;
+
           return {
             success: false,
-            errorBody: degradedReason,
-            errorStatus: 503,
-            isProviderError: true,
+            errorBody: classification.error?.message || "provider error in 200 response",
+            errorStatus: syntheticErrorStatus,
+            isProviderError: classification.isProviderError,
+            isRateLimited: classification.isRateLimited,
           };
         }
       } catch {
@@ -2803,8 +3107,8 @@ async function proxyRequest(
 
       // If it's a provider error and not the last attempt, try next model
       if (result.isProviderError && !isLastAttempt) {
-        // Track 429 rate limits to deprioritize this model for future requests
-        if (result.errorStatus === 429) {
+        // Track provider rate limits to deprioritize this model for future requests
+        if ((result.errorStatus === 429) || result.isRateLimited) {
           markRateLimited(tryModel);
         }
 
