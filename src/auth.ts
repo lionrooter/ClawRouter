@@ -33,7 +33,6 @@ import {
   generateWalletMnemonic,
   isValidMnemonic,
   deriveSolanaKeyBytes,
-  deriveSolanaKeyBytesLegacy,
   deriveAllKeys,
   getSolanaAddress,
 } from "./wallet.js";
@@ -136,10 +135,12 @@ async function generateAndSaveWallet(): Promise<{
   const existingMnemonic = await loadMnemonic();
   if (existingMnemonic) {
     throw new Error(
-      `Mnemonic file exists at ${MNEMONIC_FILE} but wallet.key is missing. ` +
-        `This means a Solana wallet was derived from this mnemonic. ` +
-        `Refusing to generate a new wallet to protect Solana funds. ` +
-        `Restore your EVM key with: export BLOCKRUN_WALLET_KEY=<your_key>`,
+      `Mnemonic file exists at ${MNEMONIC_FILE} but wallet.key is missing.\n` +
+        `Refusing to generate a new wallet to protect existing funds.\n\n` +
+        `Restore your EVM private key using one of:\n` +
+        `  Windows:   set BLOCKRUN_WALLET_KEY=0x<your_key>\n` +
+        `  Mac/Linux: export BLOCKRUN_WALLET_KEY=0x<your_key>\n\n` +
+        `Then run: npx @blockrun/clawrouter`,
     );
   }
 
@@ -207,42 +208,6 @@ async function generateAndSaveWallet(): Promise<{
 }
 
 /**
- * Log migration warning when legacy and new Solana addresses differ.
- * Checks old wallet USDC balance and prints instructions.
- */
-async function logMigrationWarning(
-  legacyKeyBytes: Uint8Array,
-  newKeyBytes: Uint8Array,
-): Promise<void> {
-  try {
-    const { createKeyPairSignerFromPrivateKeyBytes } = await import("@solana/kit");
-    const [oldSigner, newSigner] = await Promise.all([
-      createKeyPairSignerFromPrivateKeyBytes(legacyKeyBytes),
-      createKeyPairSignerFromPrivateKeyBytes(newKeyBytes),
-    ]);
-
-    console.log(`[ClawRouter]`);
-    console.log(`[ClawRouter] ⚠ SOLANA WALLET MIGRATION DETECTED`);
-    console.log(`[ClawRouter] ════════════════════════════════════════════════`);
-    console.log(`[ClawRouter]   Old address (secp256k1): ${oldSigner.address}`);
-    console.log(`[ClawRouter]   New address (SLIP-10):   ${newSigner.address}`);
-    console.log(`[ClawRouter]`);
-    console.log(`[ClawRouter]   Your Solana wallet derivation has been fixed to use`);
-    console.log(`[ClawRouter]   SLIP-10 Ed25519 (Phantom/Solflare compatible).`);
-    console.log(`[ClawRouter]`);
-    console.log(`[ClawRouter]   If you had funds in the old wallet, run:`);
-    console.log(`[ClawRouter]     /wallet migrate-solana`);
-    console.log(`[ClawRouter]`);
-    console.log(`[ClawRouter]   The new wallet pays gas. Send ~0.005 SOL to:`);
-    console.log(`[ClawRouter]     ${newSigner.address}`);
-    console.log(`[ClawRouter] ════════════════════════════════════════════════`);
-    console.log(`[ClawRouter]`);
-  } catch {
-    // Non-fatal — don't block startup if signer creation fails
-  }
-}
-
-/**
  * Resolve wallet key: load saved → env var → auto-generate.
  * Also loads mnemonic if available for Solana key derivation.
  * Called by index.ts before the auth wizard runs.
@@ -253,8 +218,6 @@ export type WalletResolution = {
   source: "saved" | "env" | "generated";
   mnemonic?: string;
   solanaPrivateKeyBytes?: Uint8Array;
-  /** Legacy (secp256k1) Solana key bytes, present when migration is needed. */
-  legacySolanaKeyBytes?: Uint8Array;
 };
 
 export async function resolveOrGenerateWalletKey(): Promise<WalletResolution> {
@@ -267,24 +230,13 @@ export async function resolveOrGenerateWalletKey(): Promise<WalletResolution> {
     const mnemonic = await loadMnemonic();
     if (mnemonic) {
       const solanaKeyBytes = deriveSolanaKeyBytes(mnemonic);
-      const result: WalletResolution = {
+      return {
         key: saved,
         address: account.address,
         source: "saved",
         mnemonic,
         solanaPrivateKeyBytes: solanaKeyBytes,
       };
-
-      // Migration detection: compare legacy (secp256k1) vs new (SLIP-10) Solana keys
-      const legacyKeyBytes = deriveSolanaKeyBytesLegacy(mnemonic);
-      if (
-        Buffer.from(legacyKeyBytes).toString("hex") !== Buffer.from(solanaKeyBytes).toString("hex")
-      ) {
-        result.legacySolanaKeyBytes = legacyKeyBytes;
-        await logMigrationWarning(legacyKeyBytes, solanaKeyBytes);
-      }
-
-      return result;
     }
 
     return { key: saved, address: account.address, source: "saved" };
@@ -299,24 +251,13 @@ export async function resolveOrGenerateWalletKey(): Promise<WalletResolution> {
     const mnemonic = await loadMnemonic();
     if (mnemonic) {
       const solanaKeyBytes = deriveSolanaKeyBytes(mnemonic);
-      const result: WalletResolution = {
+      return {
         key: envKey,
         address: account.address,
         source: "env",
         mnemonic,
         solanaPrivateKeyBytes: solanaKeyBytes,
       };
-
-      // Migration detection
-      const legacyKeyBytes = deriveSolanaKeyBytesLegacy(mnemonic);
-      if (
-        Buffer.from(legacyKeyBytes).toString("hex") !== Buffer.from(solanaKeyBytes).toString("hex")
-      ) {
-        result.legacySolanaKeyBytes = legacyKeyBytes;
-        await logMigrationWarning(legacyKeyBytes, solanaKeyBytes);
-      }
-
-      return result;
     }
 
     return { key: envKey, address: account.address, source: "env" };
@@ -331,6 +272,58 @@ export async function resolveOrGenerateWalletKey(): Promise<WalletResolution> {
     mnemonic: result.mnemonic,
     solanaPrivateKeyBytes: result.solanaPrivateKeyBytes,
   };
+}
+
+/**
+ * Recover wallet.key from existing mnemonic.
+ *
+ * ONLY works when the mnemonic was originally generated by ClawRouter
+ * (i.e., both mnemonic and EVM key were derived from the same seed).
+ * If the EVM key was set independently (manually or via env), the derived
+ * key will be different — do NOT use this in that case.
+ */
+export async function recoverWalletFromMnemonic(): Promise<void> {
+  const mnemonic = await loadMnemonic();
+  if (!mnemonic) {
+    console.error(`[ClawRouter] No mnemonic found at ${MNEMONIC_FILE}`);
+    console.error(`[ClawRouter] Cannot recover — no mnemonic to derive from.`);
+    process.exit(1);
+  }
+
+  // Safety: if wallet.key already exists, refuse to overwrite
+  const existing = await loadSavedWallet().catch(() => undefined);
+  if (existing) {
+    console.error(`[ClawRouter] wallet.key already exists at ${WALLET_FILE}`);
+    console.error(`[ClawRouter] Recovery not needed.`);
+    process.exit(1);
+  }
+
+  const derived = deriveAllKeys(mnemonic);
+  const solanaKeyBytes = deriveSolanaKeyBytes(mnemonic);
+  const solanaAddress = await getSolanaAddress(solanaKeyBytes).catch(() => undefined);
+
+  console.log(`[ClawRouter]`);
+  console.log(`[ClawRouter] ⚠  WALLET RECOVERY FROM MNEMONIC`);
+  console.log(`[ClawRouter] ════════════════════════════════════════════════`);
+  console.log(`[ClawRouter]   This only works if your mnemonic was originally`);
+  console.log(`[ClawRouter]   generated by ClawRouter (not set manually).`);
+  console.log(`[ClawRouter]`);
+  console.log(`[ClawRouter]   Derived EVM Address    : ${derived.evmAddress}`);
+  if (solanaAddress) {
+    console.log(`[ClawRouter]   Derived Solana Address : ${solanaAddress}`);
+  }
+  console.log(`[ClawRouter]`);
+  console.log(`[ClawRouter]   If the Solana address above matches your funded`);
+  console.log(`[ClawRouter]   wallet, recovery is safe to proceed.`);
+  console.log(`[ClawRouter] ════════════════════════════════════════════════`);
+  console.log(`[ClawRouter]`);
+
+  await mkdir(WALLET_DIR, { recursive: true });
+  await writeFile(WALLET_FILE, derived.evmPrivateKey + "\n", { mode: 0o600 });
+
+  console.log(`[ClawRouter] ✓ wallet.key restored at ${WALLET_FILE}`);
+  console.log(`[ClawRouter]   Run: npx @blockrun/clawrouter`);
+  console.log(`[ClawRouter]`);
 }
 
 /**

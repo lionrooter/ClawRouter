@@ -22,4 +22,17 @@ describe("resolveModelAlias", () => {
     expect(resolveModelAlias("anthropic/claude-opus-4")).toBe("anthropic/claude-opus-4.6");
     expect(resolveModelAlias("anthropic/claude-opus-4.5")).toBe("anthropic/claude-opus-4.6");
   });
+
+  it("strips openai/ prefix from virtual routing profiles (issue #78)", () => {
+    // OpenClaw sends virtual profiles as "openai/eco", "openai/free", etc.
+    expect(resolveModelAlias("openai/eco")).toBe("eco");
+    expect(resolveModelAlias("openai/free")).toBe("free");
+    expect(resolveModelAlias("openai/auto")).toBe("auto");
+    expect(resolveModelAlias("openai/premium")).toBe("premium");
+  });
+
+  it("strips openai/ prefix from aliases", () => {
+    expect(resolveModelAlias("openai/claude")).toBe("anthropic/claude-sonnet-4.6");
+    expect(resolveModelAlias("openai/sonnet")).toBe("anthropic/claude-sonnet-4.6");
+  });
 });

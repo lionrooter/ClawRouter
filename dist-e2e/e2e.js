@@ -1404,8 +1404,8 @@ var DEFAULT_ROUTING_CONFIG = {
         "google/gemini-2.5-pro",
         "deepseek/deepseek-chat",
         "xai/grok-4-0709",
-        "openai/gpt-5.2",
-        // Newer and cheaper input than gpt-4o
+        "openai/gpt-5.4",
+        // Newest flagship, same price as 4o
         "openai/gpt-4o",
         "anthropic/claude-sonnet-4.6",
       ],
@@ -1471,6 +1471,8 @@ var DEFAULT_ROUTING_CONFIG = {
       primary: "anthropic/claude-opus-4.6",
       // Best quality for complex tasks
       fallback: [
+        "openai/gpt-5.4",
+        // Newest flagship
         "openai/gpt-5.2-codex",
         "anthropic/claude-opus-4.6",
         "anthropic/claude-sonnet-4.6",
@@ -1518,7 +1520,8 @@ var DEFAULT_ROUTING_CONFIG = {
       fallback: [
         "anthropic/claude-opus-4.6",
         // Latest Opus - best agentic
-        "openai/gpt-5.2",
+        "openai/gpt-5.4",
+        // Newest flagship
         "google/gemini-3.1-pro",
         // Newest Gemini
         "google/gemini-3-pro-preview",
@@ -1562,9 +1565,11 @@ function route(prompt, systemPrompt, maxOutputTokens, options) {
     const agenticScore = ruleResult.agenticScore ?? 0;
     const isAutoAgentic = agenticScore >= 0.5;
     const isExplicitAgentic = config2.overrides.agenticMode ?? false;
-    const useAgenticTiers = (isAutoAgentic || isExplicitAgentic) && config2.agenticTiers != null;
+    const hasToolsInRequest = options.hasTools ?? false;
+    const useAgenticTiers =
+      (hasToolsInRequest || isAutoAgentic || isExplicitAgentic) && config2.agenticTiers != null;
     tierConfigs = useAgenticTiers ? config2.agenticTiers : config2.tiers;
-    profileSuffix = useAgenticTiers ? " | agentic" : "";
+    profileSuffix = useAgenticTiers ? ` | agentic${hasToolsInRequest ? " (tools)" : ""}` : "";
   }
   const agenticScoreValue = ruleResult.agenticScore;
   if (estimatedTokens > config2.overrides.maxTokensForceComplex) {
@@ -1646,7 +1651,9 @@ var MODEL_ALIASES = {
   // OpenAI
   gpt: "openai/gpt-4o",
   gpt4: "openai/gpt-4o",
-  gpt5: "openai/gpt-5.2",
+  gpt5: "openai/gpt-5.4",
+  "gpt-5.4": "openai/gpt-5.4",
+  "gpt-5.4-pro": "openai/gpt-5.4-pro",
   codex: "openai/gpt-5.2-codex",
   mini: "openai/gpt-4o-mini",
   o1: "openai/o1",
@@ -1687,6 +1694,13 @@ function resolveModelAlias(model) {
     const resolvedWithoutPrefix = MODEL_ALIASES[withoutPrefix];
     if (resolvedWithoutPrefix) return resolvedWithoutPrefix;
     return withoutPrefix;
+  }
+  if (normalized.startsWith("openai/")) {
+    const withoutPrefix = normalized.slice("openai/".length);
+    const resolvedWithoutPrefix = MODEL_ALIASES[withoutPrefix];
+    if (resolvedWithoutPrefix) return resolvedWithoutPrefix;
+    const isVirtualProfile = BLOCKRUN_MODELS.some((m) => m.id === withoutPrefix);
+    if (isVirtualProfile) return withoutPrefix;
   }
   return model;
 }
@@ -1765,6 +1779,31 @@ var BLOCKRUN_MODELS = [
     version: "5.2",
     inputPrice: 21,
     outputPrice: 168,
+    contextWindow: 4e5,
+    maxOutput: 128e3,
+    reasoning: true,
+    toolCalling: true,
+  },
+  // GPT-5.4 — newest flagship, same input price as 4o but much more capable
+  {
+    id: "openai/gpt-5.4",
+    name: "GPT-5.4",
+    version: "5.4",
+    inputPrice: 2.5,
+    outputPrice: 15,
+    contextWindow: 4e5,
+    maxOutput: 128e3,
+    reasoning: true,
+    vision: true,
+    agentic: true,
+    toolCalling: true,
+  },
+  {
+    id: "openai/gpt-5.4-pro",
+    name: "GPT-5.4 Pro",
+    version: "5.4",
+    inputPrice: 30,
+    outputPrice: 180,
     contextWindow: 4e5,
     maxOutput: 128e3,
     reasoning: true,
@@ -1966,7 +2005,6 @@ var BLOCKRUN_MODELS = [
     contextWindow: 1e6,
     maxOutput: 65536,
     vision: true,
-    toolCalling: true,
   },
   {
     id: "google/gemini-2.5-pro",
@@ -2222,6 +2260,9 @@ function isReasoningModel(modelId) {
 // src/proxy.ts
 import { createServer } from "http";
 import { finished } from "stream";
+import { homedir as homedir4 } from "os";
+import { join as join5 } from "path";
+import { mkdir as mkdir3, writeFile as writeFile2, readFile, stat as fsStat } from "fs/promises";
 import { createPublicClient as createPublicClient2, http as http2 } from "viem";
 import { base as base2 } from "viem/chains";
 import { privateKeyToAccount as privateKeyToAccount3 } from "viem/accounts";
@@ -2264,7 +2305,10 @@ function createPayFetchWithPreAuth(baseFetch, client, ttlMs = DEFAULT_TTL_MS, op
       const getHeader = (name) => response.headers.get(name);
       let body;
       try {
-        const responseText = await response.text();
+        const responseText = await Promise.race([
+          response.text(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Body read timeout")), 3e4)),
+        ]);
         if (responseText) body = JSON.parse(responseText);
       } catch {}
       paymentRequired = httpClient.getPaymentRequiredResponse(getHeader, body);
@@ -2272,6 +2316,7 @@ function createPayFetchWithPreAuth(baseFetch, client, ttlMs = DEFAULT_TTL_MS, op
     } catch (error) {
       throw new Error(
         `Failed to parse payment requirements: ${error instanceof Error ? error.message : "Unknown error"}`,
+        { cause: error },
       );
     }
     const payload = await client.createPaymentPayload(paymentRequired);
@@ -2308,7 +2353,7 @@ async function logUsage(entry) {
 }
 
 // src/stats.ts
-import { readdir } from "fs/promises";
+import { readdir, unlink } from "fs/promises";
 
 // src/fs-read.ts
 import { open } from "fs/promises";
@@ -2316,9 +2361,15 @@ import { openSync, readSync, closeSync, fstatSync } from "fs";
 async function readTextFile(filePath) {
   const fh = await open(filePath, "r");
   try {
-    const buf = Buffer.alloc((await fh.stat()).size);
-    await fh.read(buf, 0, buf.length, 0);
-    return buf.toString("utf-8");
+    const size = (await fh.stat()).size;
+    const buf = Buffer.alloc(size);
+    let offset = 0;
+    while (offset < size) {
+      const { bytesRead } = await fh.read(buf, offset, size - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    return buf.subarray(0, offset).toString("utf-8");
   } finally {
     await fh.close();
   }
@@ -2345,18 +2396,22 @@ async function parseLogFile(filePath) {
   try {
     const content = await readTextFile(filePath);
     const lines = content.trim().split("\n").filter(Boolean);
-    return lines.map((line) => {
-      const entry = JSON.parse(line);
-      return {
-        timestamp: entry.timestamp || /* @__PURE__ */ new Date().toISOString(),
-        model: entry.model || "unknown",
-        tier: entry.tier || "UNKNOWN",
-        cost: entry.cost || 0,
-        baselineCost: entry.baselineCost || entry.cost || 0,
-        savings: entry.savings || 0,
-        latencyMs: entry.latencyMs || 0,
-      };
-    });
+    const entries = [];
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        entries.push({
+          timestamp: entry.timestamp || /* @__PURE__ */ new Date().toISOString(),
+          model: entry.model || "unknown",
+          tier: entry.tier || "UNKNOWN",
+          cost: entry.cost || 0,
+          baselineCost: entry.baselineCost || entry.cost || 0,
+          savings: entry.savings || 0,
+          latencyMs: entry.latencyMs || 0,
+        });
+      } catch {}
+    }
+    return entries;
   } catch {
     return [];
   }
@@ -2468,6 +2523,16 @@ async function getStats(days = 7) {
     entriesWithBaseline,
     // How many entries have valid baseline tracking
   };
+}
+async function clearStats() {
+  try {
+    const files = await readdir(LOG_DIR2);
+    const logFiles = files.filter((f) => f.startsWith("usage-") && f.endsWith(".jsonl"));
+    await Promise.all(logFiles.map((f) => unlink(join3(LOG_DIR2, f))));
+    return { deletedFiles: logFiles.length };
+  } catch {
+    return { deletedFiles: 0 };
+  }
 }
 
 // src/dedup.ts
@@ -2834,12 +2899,18 @@ var BalanceMonitor = class {
    */
   async checkBalance() {
     const now = Date.now();
-    if (this.cachedBalance !== null && now - this.cachedAt < CACHE_TTL_MS) {
+    if (
+      this.cachedBalance !== null &&
+      this.cachedBalance > 0n &&
+      now - this.cachedAt < CACHE_TTL_MS
+    ) {
       return this.buildInfo(this.cachedBalance);
     }
     const balance = await this.fetchBalance();
-    this.cachedBalance = balance;
-    this.cachedAt = now;
+    if (balance > 0n) {
+      this.cachedBalance = balance;
+      this.cachedAt = now;
+    }
     return this.buildInfo(balance);
   }
   /**
@@ -2942,12 +3013,18 @@ var SolanaBalanceMonitor = class {
   }
   async checkBalance() {
     const now = Date.now();
-    if (this.cachedBalance !== null && now - this.cachedAt < CACHE_TTL_MS2) {
+    if (
+      this.cachedBalance !== null &&
+      this.cachedBalance > 0n &&
+      now - this.cachedAt < CACHE_TTL_MS2
+    ) {
       return this.buildInfo(this.cachedBalance);
     }
     const balance = await this.fetchBalance();
-    this.cachedBalance = balance;
-    this.cachedAt = now;
+    if (balance > 0n) {
+      this.cachedBalance = balance;
+      this.cachedAt = now;
+    }
     return this.buildInfo(balance);
   }
   deductEstimated(amountMicros) {
@@ -2991,6 +3068,14 @@ var SolanaBalanceMonitor = class {
   async fetchBalance() {
     const owner = solAddress(this.walletAddress);
     const mint = solAddress(SOLANA_USDC_MINT);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await this.fetchBalanceOnce(owner, mint);
+      if (result > 0n || attempt === 1) return result;
+      await new Promise((r) => setTimeout(r, 1e3));
+    }
+    return 0n;
+  }
+  async fetchBalanceOnce(owner, mint) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), BALANCE_TIMEOUT_MS);
     try {
@@ -3007,6 +3092,7 @@ var SolanaBalanceMonitor = class {
     } catch (err) {
       throw new Error(
         `Failed to fetch Solana USDC balance: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
       );
     } finally {
       clearTimeout(timer);
@@ -3035,6 +3121,7 @@ import { HDKey } from "@scure/bip32";
 import { generateMnemonic, mnemonicToSeedSync, validateMnemonic } from "@scure/bip39";
 import { wordlist as english } from "@scure/bip39/wordlists/english";
 import { privateKeyToAccount } from "viem/accounts";
+var SOLANA_HARDENED_INDICES = [44 + 2147483648, 501 + 2147483648, 0 + 2147483648, 0 + 2147483648];
 
 // src/auth.ts
 var WALLET_DIR = join4(homedir3(), ".openclaw", "blockrun");
@@ -4023,7 +4110,6 @@ function hashRequestContent(lastUserContent, toolCallNames) {
 
 // src/updater.ts
 var NPM_REGISTRY = "https://registry.npmjs.org/@blockrun/clawrouter/latest";
-var UPDATE_URL = "https://blockrun.ai/ClawRouter-update";
 var CHECK_TIMEOUT_MS = 5e3;
 function compareSemver(a, b) {
   const pa = a.split(".").map(Number);
@@ -4052,7 +4138,7 @@ async function checkForUpdates() {
       console.log(
         `\x1B[33m\u2B06\uFE0F  ClawRouter ${latest} available (you have ${VERSION})\x1B[0m`,
       );
-      console.log(`   Run: \x1B[36mcurl -fsSL ${UPDATE_URL} | bash\x1B[0m`);
+      console.log(`   Run: \x1B[36mnpx @blockrun/clawrouter@latest\x1B[0m`);
       console.log("");
     }
   } catch {}
@@ -4242,6 +4328,7 @@ ${lines.join("\n")}`;
 // src/proxy.ts
 var BLOCKRUN_API = "https://blockrun.ai/api";
 var BLOCKRUN_SOLANA_API = "https://sol.blockrun.ai/api";
+var IMAGE_DIR = join5(homedir4(), ".openclaw", "blockrun", "images");
 var AUTO_MODEL = "blockrun/auto";
 var ROUTING_PROFILES = /* @__PURE__ */ new Set([
   "blockrun/free",
@@ -4263,6 +4350,31 @@ var HEALTH_CHECK_TIMEOUT_MS = 2e3;
 var RATE_LIMIT_COOLDOWN_MS = 6e4;
 var PORT_RETRY_ATTEMPTS = 5;
 var PORT_RETRY_DELAY_MS = 1e3;
+var MODEL_BODY_READ_TIMEOUT_MS = 3e5;
+var ERROR_BODY_READ_TIMEOUT_MS = 3e4;
+async function readBodyWithTimeout(body, timeoutMs = MODEL_BODY_READ_TIMEOUT_MS) {
+  if (!body) return [];
+  const reader = body.getReader();
+  const chunks = [];
+  let timer;
+  try {
+    while (true) {
+      const result = await Promise.race([
+        reader.read(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Body read timeout")), timeoutMs);
+        }),
+      ]);
+      clearTimeout(timer);
+      if (result.done) break;
+      chunks.push(result.value);
+    }
+  } finally {
+    clearTimeout(timer);
+    reader.releaseLock();
+  }
+  return chunks;
+}
 function transformPaymentError(errorBody) {
   try {
     const parsed = JSON.parse(errorBody);
@@ -4303,9 +4415,26 @@ function transformPaymentError(errorBody) {
             },
           });
         }
+        if (innerJson.invalidReason === "transaction_simulation_failed") {
+          console.error(
+            `[ClawRouter] Solana transaction simulation failed: ${innerJson.invalidMessage || "unknown"}`,
+          );
+          return JSON.stringify({
+            error: {
+              message: "Solana payment simulation failed. Retrying with a different model.",
+              type: "transaction_simulation_failed",
+              help: "This is usually temporary. If it persists, check your Solana USDC balance or try: /model free",
+            },
+          });
+        }
       }
     }
-    if (parsed.error === "Settlement failed" || parsed.details?.includes("Settlement failed")) {
+    if (
+      parsed.error === "Settlement failed" ||
+      parsed.error === "Payment settlement failed" ||
+      parsed.details?.includes("Settlement failed") ||
+      parsed.details?.includes("transaction_simulation_failed")
+    ) {
       const details = parsed.details || "";
       const gasError = details.includes("unable to estimate gas");
       return JSON.stringify({
@@ -4359,6 +4488,8 @@ function canWrite(res) {
 }
 function safeWrite(res, data) {
   if (!canWrite(res)) {
+    const bytes = typeof data === "string" ? Buffer.byteLength(data) : data.length;
+    console.warn(`[ClawRouter] safeWrite: socket not writable, dropping ${bytes} bytes`);
     return false;
   }
   return res.write(data);
@@ -4776,15 +4907,9 @@ async function proxyPartnerRequest(req, res, apiBase, payFetch) {
   });
   res.writeHead(upstream.status, responseHeaders);
   if (upstream.body) {
-    const reader = upstream.body.getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        safeWrite(res, Buffer.from(value));
-      }
-    } finally {
-      reader.releaseLock();
+    const chunks = await readBodyWithTimeout(upstream.body, ERROR_BODY_READ_TIMEOUT_MS);
+    for (const chunk of chunks) {
+      safeWrite(res, Buffer.from(chunk));
     }
   }
   res.end();
@@ -4814,16 +4939,23 @@ async function uploadDataUriToHost(dataUri) {
   const form = new FormData();
   form.append("reqtype", "fileupload");
   form.append("fileToUpload", blob, `image.${ext}`);
-  const resp = await fetch("https://catbox.moe/user/api.php", {
-    method: "POST",
-    body: form,
-  });
-  if (!resp.ok) throw new Error(`catbox.moe upload failed: HTTP ${resp.status}`);
-  const result = await resp.text();
-  if (result.startsWith("https://")) {
-    return result.trim();
+  const uploadController = new AbortController();
+  const uploadTimeout = setTimeout(() => uploadController.abort(), 3e4);
+  try {
+    const resp = await fetch("https://catbox.moe/user/api.php", {
+      method: "POST",
+      body: form,
+      signal: uploadController.signal,
+    });
+    if (!resp.ok) throw new Error(`catbox.moe upload failed: HTTP ${resp.status}`);
+    const result = await resp.text();
+    if (result.startsWith("https://")) {
+      return result.trim();
+    }
+    throw new Error(`catbox.moe upload failed: ${result}`);
+  } finally {
+    clearTimeout(uploadTimeout);
   }
-  throw new Error(`catbox.moe upload failed: ${result}`);
 }
 async function startProxy(options) {
   const walletKey2 = typeof options.wallet === "string" ? options.wallet : options.wallet.key;
@@ -4835,8 +4967,12 @@ async function startProxy(options) {
     (paymentChain === "solana" && solanaPrivateKeyBytes ? BLOCKRUN_SOLANA_API : BLOCKRUN_API);
   if (paymentChain === "solana" && !solanaPrivateKeyBytes) {
     console.warn(
-      `[ClawRouter] Payment chain is Solana but no Solana keys provided. Using Base (EVM).`,
+      `[ClawRouter] \u26A0 Payment chain is Solana but no mnemonic found \u2014 falling back to Base (EVM).`,
     );
+    console.warn(
+      `[ClawRouter]   To fix: run "npx @blockrun/clawrouter wallet recover" if your mnemonic exists,`,
+    );
+    console.warn(`[ClawRouter]   or run "npx @blockrun/clawrouter chain base" to switch to EVM.`);
   } else if (paymentChain === "solana") {
     console.log(`[ClawRouter] Payment chain: Solana (${BLOCKRUN_SOLANA_API})`);
   }
@@ -4976,6 +5112,21 @@ async function startProxy(options) {
       res.end(JSON.stringify(stats, null, 2));
       return;
     }
+    if (req.url === "/stats" && req.method === "DELETE") {
+      try {
+        const result = await clearStats();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ cleared: true, deletedFiles: result.deletedFiles }));
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: `Failed to clear stats: ${err instanceof Error ? err.message : String(err)}`,
+          }),
+        );
+      }
+      return;
+    }
     if (req.url === "/stats" || req.url?.startsWith("/stats?")) {
       try {
         const url = new URL(req.url, "http://localhost");
@@ -5000,6 +5151,93 @@ async function startProxy(options) {
       const models = buildProxyModelList();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ object: "list", data: models }));
+      return;
+    }
+    if (req.url?.startsWith("/images/") && req.method === "GET") {
+      const filename = req.url
+        .slice("/images/".length)
+        .split("?")[0]
+        .replace(/[^a-zA-Z0-9._-]/g, "");
+      if (!filename) {
+        res.writeHead(400);
+        res.end("Bad request");
+        return;
+      }
+      const filePath = join5(IMAGE_DIR, filename);
+      try {
+        const s = await fsStat(filePath);
+        if (!s.isFile()) throw new Error("not a file");
+        const ext = filename.split(".").pop()?.toLowerCase() ?? "png";
+        const mime = {
+          png: "image/png",
+          jpg: "image/jpeg",
+          jpeg: "image/jpeg",
+          webp: "image/webp",
+          gif: "image/gif",
+        };
+        const data = await readFile(filePath);
+        res.writeHead(200, {
+          "Content-Type": mime[ext] ?? "application/octet-stream",
+          "Content-Length": data.length,
+        });
+        res.end(data);
+      } catch {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Image not found" }));
+      }
+      return;
+    }
+    if (req.url === "/v1/images/generations" && req.method === "POST") {
+      const chunks = [];
+      for await (const chunk of req) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      const reqBody = Buffer.concat(chunks);
+      try {
+        const upstream = await payFetch(`${apiBase}/v1/images/generations`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "user-agent": USER_AGENT },
+          body: reqBody,
+        });
+        const text = await upstream.text();
+        if (!upstream.ok) {
+          res.writeHead(upstream.status, { "Content-Type": "application/json" });
+          res.end(text);
+          return;
+        }
+        let result;
+        try {
+          result = JSON.parse(text);
+        } catch {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(text);
+          return;
+        }
+        if (result.data?.length) {
+          await mkdir3(IMAGE_DIR, { recursive: true });
+          const port2 = server.address()?.port ?? 8402;
+          for (const img of result.data) {
+            const m = img.url?.match(/^data:(image\/\w+);base64,(.+)$/);
+            if (m) {
+              const [, mimeType, b64] = m;
+              const ext = mimeType === "image/jpeg" ? "jpg" : (mimeType.split("/")[1] ?? "png");
+              const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+              await writeFile2(join5(IMAGE_DIR, filename), Buffer.from(b64, "base64"));
+              img.url = `http://localhost:${port2}/images/${filename}`;
+              console.log(`[ClawRouter] Image saved \u2192 ${img.url}`);
+            }
+          }
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[ClawRouter] Image generation error: ${msg}`);
+        if (!res.headersSent) {
+          res.writeHead(502, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Image generation failed", details: msg }));
+        }
+      }
       return;
     }
     if (req.url?.match(/^\/v1\/(?:x|partner)\//)) {
@@ -5107,6 +5345,7 @@ async function startProxy(options) {
         if (error.existingChain && error.existingChain !== paymentChain) {
           throw new Error(
             `Existing proxy on port ${listenPort} is using ${error.existingChain} but ${paymentChain} was requested. Stop the existing proxy first or use a different port.`,
+            { cause: err },
           );
         }
         const baseUrl2 = `http://127.0.0.1:${listenPort}`;
@@ -5233,7 +5472,8 @@ async function tryModelRequest(
       signal,
     });
     if (response.status !== 200) {
-      const errorBody = await response.text();
+      const errorBodyChunks = await readBodyWithTimeout(response.body, ERROR_BODY_READ_TIMEOUT_MS);
+      const errorBody = Buffer.concat(errorBodyChunks).toString();
       const isProviderErr = isProviderError(response.status, errorBody);
       return {
         success: false,
@@ -5245,7 +5485,11 @@ async function tryModelRequest(
     const contentType = response.headers.get("content-type") || "";
     if (contentType.includes("json") || contentType.includes("text")) {
       try {
-        const responseBody = await response.clone().text();
+        const clonedChunks = await readBodyWithTimeout(
+          response.clone().body,
+          ERROR_BODY_READ_TIMEOUT_MS,
+        );
+        const responseBody = Buffer.concat(clonedChunks).toString();
         const degradedReason = detectDegradedSuccessResponse(responseBody);
         if (degradedReason) {
           return {
@@ -5664,9 +5908,10 @@ async function proxyRequest(
         typeof parsed.model === "string" ? parsed.model.trim().toLowerCase() : "";
       const resolvedModel = resolveModelAlias(normalizedModel);
       const wasAlias = resolvedModel !== normalizedModel;
-      const isRoutingProfile = ROUTING_PROFILES.has(normalizedModel);
+      const isRoutingProfile =
+        ROUTING_PROFILES.has(normalizedModel) || ROUTING_PROFILES.has(resolvedModel);
       if (isRoutingProfile) {
-        const profileName = normalizedModel.replace("blockrun/", "");
+        const profileName = resolvedModel.replace("blockrun/", "");
         routingProfile = profileName;
       }
       console.log(
@@ -5716,7 +5961,7 @@ async function proxyRequest(
           const tools = parsed.tools;
           hasTools = Array.isArray(tools) && tools.length > 0;
           if (hasTools && tools) {
-            console.log(`[ClawRouter] Tools detected (${tools.length}), agentic mode via keywords`);
+            console.log(`[ClawRouter] Tools detected (${tools.length}), forcing agentic tiers`);
           }
           hasVision = parsedMessages.some((m) => {
             if (Array.isArray(m.content)) {
@@ -5730,6 +5975,7 @@ async function proxyRequest(
           routingDecision = route(prompt, systemPrompt, maxTokens, {
             ...routerOpts2,
             routingProfile: routingProfile ?? void 0,
+            hasTools,
           });
           if (existingSession) {
             const tierRank = {
@@ -6036,12 +6282,27 @@ async function proxyRequest(
           `[ClawRouter] Context filter (~${estimatedTotalTokens} tokens): excluded ${contextExcluded.join(", ")}`,
         );
       }
-      const toolFiltered = filterByToolCalling(contextFiltered, hasTools, supportsToolCalling);
+      let toolFiltered = filterByToolCalling(contextFiltered, hasTools, supportsToolCalling);
       const toolExcluded = contextFiltered.filter((m) => !toolFiltered.includes(m));
       if (toolExcluded.length > 0) {
         console.log(
           `[ClawRouter] Tool-calling filter: excluded ${toolExcluded.join(", ")} (no structured function call support)`,
         );
+      }
+      const TOOL_NONCOMPLIANT_MODELS = [
+        "google/gemini-2.5-flash-lite",
+        "google/gemini-3-pro-preview",
+        "google/gemini-3.1-pro",
+      ];
+      if (hasTools && toolFiltered.length > 1) {
+        const compliant = toolFiltered.filter((m) => !TOOL_NONCOMPLIANT_MODELS.includes(m));
+        if (compliant.length > 0 && compliant.length < toolFiltered.length) {
+          const dropped = toolFiltered.filter((m) => TOOL_NONCOMPLIANT_MODELS.includes(m));
+          console.log(
+            `[ClawRouter] Tool-compliance filter: excluded ${dropped.join(", ")} (unreliable tool schema handling)`,
+          );
+          toolFiltered = compliant;
+        }
       }
       const visionFiltered = filterByVision(toolFiltered, hasVision, supportsVision);
       const visionExcluded = toolFiltered.filter((m) => !visionFiltered.includes(m));
@@ -6089,10 +6350,24 @@ async function proxyRequest(
       if (result.isProviderError && !isLastAttempt) {
         if (result.errorStatus === 429) {
           markRateLimited(tryModel);
+          try {
+            const parsed = JSON.parse(result.errorBody || "{}");
+            if (parsed.update_available) {
+              console.log("");
+              console.log(
+                `\x1B[33m\u2B06\uFE0F  ClawRouter ${parsed.update_available} available (you have ${VERSION})\x1B[0m`,
+              );
+              console.log(
+                `   Run: \x1B[36mcurl -fsSL ${parsed.update_url || "https://blockrun.ai/ClawRouter-update"} | bash\x1B[0m`,
+              );
+              console.log("");
+            }
+          } catch {}
         }
-        const isPaymentErr = /payment.*verification.*failed|insufficient.*funds/i.test(
-          result.errorBody || "",
-        );
+        const isPaymentErr =
+          /payment.*verification.*failed|payment.*settlement.*failed|insufficient.*funds|transaction_simulation_failed/i.test(
+            result.errorBody || "",
+          );
         if (isPaymentErr && tryModel !== FREE_MODEL) {
           const freeIdx = modelsToTry.indexOf(FREE_MODEL);
           if (freeIdx > i + 1) {
@@ -6195,17 +6470,7 @@ async function proxyRequest(
     const responseChunks = [];
     if (headersSentEarly) {
       if (upstream.body) {
-        const reader = upstream.body.getReader();
-        const chunks = [];
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-          }
-        } finally {
-          reader.releaseLock();
-        }
+        const chunks = await readBodyWithTimeout(upstream.body);
         const jsonBody = Buffer.concat(chunks);
         const jsonStr = jsonBody.toString();
         try {
@@ -6347,15 +6612,9 @@ async function proxyRequest(
       }
       const bodyParts = [];
       if (upstream.body) {
-        const reader = upstream.body.getReader();
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            bodyParts.push(Buffer.from(value));
-          }
-        } finally {
-          reader.releaseLock();
+        const chunks = await readBodyWithTimeout(upstream.body);
+        for (const chunk of chunks) {
+          bodyParts.push(Buffer.from(chunk));
         }
       }
       let responseBody = Buffer.concat(bodyParts);

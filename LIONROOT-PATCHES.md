@@ -43,7 +43,7 @@ Preserve:
 - `src/proxy.local-dispatch.test.ts` — focused coverage for local proxy dispatch helpers
 - `src/proxy.degraded-response.test.ts` — degraded-provider fallback behavior
 - `test/fallback.ts` — fallback-chain expectations
-- `test/integration/setup.ts` — Lionroot integration-harness port isolation
+- `test/integration/setup.ts` — preserve upstream worker-scoped integration harness semantics; do not revert to ephemeral port 0
 - `AGENTS.md`
 - `CLAUDE.md`
 
@@ -55,7 +55,13 @@ Preserve:
 - `8767c79` — test(clawrouter): isolate integration proxy port
 - `1301876` — fix(clawrouter): harden fallback routing for degraded providers
 
-## 4. Mainline policy
+## 4. Upstream sync notes (2026-03-10)
+
+- Upstream sync landed on fork `main` by additive merge, not by replacing Lionroot surfaces wholesale.
+- `src/proxy.ts` must keep Lionroot local CLI dispatch (`LOCAL_CLI_PROXY_API`, `usesLocalCliProxy(...)`, `resolveModelDispatchUrl(...)`) while also keeping upstream image-generation, update-hint, and body-read-timeout logic.
+- `test/integration/setup.ts` should follow upstream worker-scoped test-port allocation.
+
+## 5. Mainline policy
 
 - Fork mainline is `main`.
 - Move Lionroot changes onto `main`; do not leave them stranded on `lionroot/upstream-sync-*` branches.

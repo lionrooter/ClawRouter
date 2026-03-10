@@ -186,7 +186,7 @@ function buildMemoryAgentTools(memoryAgentBaseUrl: string) {
         properties: {},
         required: [],
       },
-      execute: async (_toolCallId: string, _params: Record<string, unknown>) => {
+      execute: async () => {
         const response = await callMemoryAgent(memoryAgentBaseUrl, "/memories", {
           method: "GET",
         });
@@ -430,14 +430,8 @@ function injectModelsConfig(logger: { info: (msg: string) => void }): void {
     needsWrite = true;
   }
   const allowlist = defaults.models as Record<string, unknown>;
-  // Clean out old blockrun entries that aren't in TOP_MODELS (from previous versions)
-  const topSet = new Set(TOP_MODELS.map((id) => `blockrun/${id}`));
-  for (const key of Object.keys(allowlist)) {
-    if (key.startsWith("blockrun/") && !topSet.has(key)) {
-      delete allowlist[key];
-      needsWrite = true;
-    }
-  }
+  // Additive-only: add TOP_MODELS entries if missing, never delete user-defined entries.
+  // Preserves any blockrun/* IDs the user has manually added outside this curated list.
   let addedCount = 0;
   for (const id of TOP_MODELS) {
     const key = `blockrun/${id}`;
@@ -623,21 +617,25 @@ async function startProxyInBackground(api: OpenClawPluginApi): Promise<void> {
   const currentChain = await resolvePaymentChain();
   const displayAddress =
     currentChain === "solana" && proxy.solanaAddress ? proxy.solanaAddress : wallet.address;
+  const network = currentChain === "solana" ? "Solana" : "Base";
   proxy.balanceMonitor
     .checkBalance()
     .then((balance) => {
       if (balance.isEmpty) {
-        api.logger.info(`Wallet: ${displayAddress} | Balance: $0.00`);
-        api.logger.info(`Using FREE model. Fund wallet for premium models.`);
+        api.logger.info(`Wallet (${network}): ${displayAddress}`);
+        api.logger.info(
+          `Balance: $0.00 — send USDC on ${network} to the address above to unlock paid models.`,
+        );
       } else if (balance.isLow) {
-        api.logger.info(`Wallet: ${displayAddress} | Balance: ${balance.balanceUSD} (low)`);
+        api.logger.info(
+          `Wallet (${network}): ${displayAddress} | Balance: ${balance.balanceUSD} (low — top up soon)`,
+        );
       } else {
-        api.logger.info(`Wallet: ${displayAddress} | Balance: ${balance.balanceUSD}`);
+        api.logger.info(`Wallet (${network}): ${displayAddress} | Balance: ${balance.balanceUSD}`);
       }
     })
     .catch(() => {
-      // Silently continue - balance will be checked per-request anyway
-      api.logger.info(`Wallet: ${displayAddress} | Balance: (checking...)`);
+      api.logger.info(`Wallet (${network}): ${displayAddress} | Balance: (checking...)`);
     });
 }
 

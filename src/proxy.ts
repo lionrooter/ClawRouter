@@ -22,6 +22,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { finished } from "node:stream";
 import type { AddressInfo } from "node:net";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { mkdir, writeFile, readFile, stat as fsStat } from "node:fs/promises";
 import { createPublicClient, http } from "viem";
 import { base } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
@@ -67,7 +70,7 @@ import { compressContext, shouldCompress, type NormalizedMessage } from "./compr
 // Error classes available for programmatic use but not used in proxy
 // (universal free fallback means we don't throw balance errors anymore)
 // import { InsufficientFundsError, EmptyWalletError } from "./errors.js";
-import { USER_AGENT } from "./version.js";
+import { USER_AGENT, VERSION } from "./version.js";
 import {
   SessionStore,
   getSessionId,
@@ -82,6 +85,7 @@ import { SessionJournal } from "./journal.js";
 const BLOCKRUN_API = "https://blockrun.ai/api";
 const BLOCKRUN_SOLANA_API = "https://sol.blockrun.ai/api";
 const LOCAL_CLI_PROXY_API = "http://127.0.0.1:11435";
+const IMAGE_DIR = join(homedir(), ".openclaw", "blockrun", "images");
 // Routing profile models - virtual models that trigger intelligent routing
 const AUTO_MODEL = "blockrun/auto";
 
@@ -105,6 +109,38 @@ const HEALTH_CHECK_TIMEOUT_MS = 2_000; // Timeout for checking existing proxy
 const RATE_LIMIT_COOLDOWN_MS = 60_000; // 60 seconds cooldown for rate-limited models
 const PORT_RETRY_ATTEMPTS = 5; // Max attempts to bind port (handles TIME_WAIT)
 const PORT_RETRY_DELAY_MS = 1_000; // Delay between retry attempts
+const MODEL_BODY_READ_TIMEOUT_MS = 300_000; // 5 minutes for model responses (reasoning models are slow)
+const ERROR_BODY_READ_TIMEOUT_MS = 30_000; // 30 seconds for error/partner body reads
+
+async function readBodyWithTimeout(
+  body: ReadableStream<Uint8Array> | null,
+  timeoutMs: number = MODEL_BODY_READ_TIMEOUT_MS,
+): Promise<Uint8Array[]> {
+  if (!body) return [];
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    while (true) {
+      const result = await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Body read timeout")), timeoutMs);
+        }),
+      ]);
+      clearTimeout(timer);
+      if (result.done) break;
+      chunks.push(result.value);
+    }
+  } finally {
+    clearTimeout(timer);
+    reader.releaseLock();
+  }
+
+  return chunks;
+}
 
 /**
  * Transform upstream payment errors into user-friendly messages.
@@ -116,6 +152,10 @@ function transformPaymentError(errorBody: string): string {
     const parsed = JSON.parse(errorBody) as {
       error?: string;
       details?: string;
+      // blockrun-sol (Solana) format uses code+debug instead of details
+      code?: string;
+      debug?: string;
+      payer?: string;
     };
 
     // Check if this is a payment verification error
@@ -182,6 +222,76 @@ function transformPaymentError(errorBody: string): string {
           });
         }
       }
+    }
+
+    // Handle blockrun-sol (Solana) format: code=PAYMENT_INVALID + debug=invalidReason string
+    if (
+      parsed.error === "Payment verification failed" &&
+      parsed.code === "PAYMENT_INVALID" &&
+      parsed.debug
+    ) {
+      const debugLower = parsed.debug.toLowerCase();
+      const wallet = parsed.payer || "unknown";
+      const shortWallet =
+        wallet.length > 12 ? `${wallet.slice(0, 6)}...${wallet.slice(-4)}` : wallet;
+
+      if (debugLower.includes("insufficient")) {
+        return JSON.stringify({
+          error: {
+            message: "Insufficient Solana USDC balance.",
+            type: "insufficient_funds",
+            wallet,
+            help: `Fund wallet ${shortWallet} with USDC on Solana, or switch to Base: /wallet base`,
+          },
+        });
+      }
+
+      if (
+        debugLower.includes("transaction_simulation_failed") ||
+        debugLower.includes("simulation")
+      ) {
+        console.error(`[ClawRouter] Solana transaction simulation failed: ${parsed.debug}`);
+        return JSON.stringify({
+          error: {
+            message: "Solana payment simulation failed. Retrying with a different model.",
+            type: "transaction_simulation_failed",
+            help: "This is usually temporary. If it persists, try: /model free",
+          },
+        });
+      }
+
+      if (debugLower.includes("invalid signature") || debugLower.includes("invalid_signature")) {
+        return JSON.stringify({
+          error: {
+            message: "Solana payment signature invalid.",
+            type: "invalid_payload",
+            help: "Try again. If this persists, reinstall ClawRouter: curl -fsSL https://blockrun.ai/ClawRouter-update | bash",
+          },
+        });
+      }
+
+      if (debugLower.includes("expired")) {
+        return JSON.stringify({
+          error: {
+            message: "Solana payment expired. Retrying.",
+            type: "expired",
+            help: "This is usually temporary.",
+          },
+        });
+      }
+
+      // Unknown Solana verification error — surface the debug reason
+      console.error(
+        `[ClawRouter] Solana payment verification failed: ${parsed.debug} payer=${wallet}`,
+      );
+      return JSON.stringify({
+        error: {
+          message: `Solana payment verification failed: ${parsed.debug}`,
+          type: "payment_invalid",
+          wallet,
+          help: "Try again or switch to Base: /wallet base",
+        },
+      });
     }
 
     // Handle settlement failures (gas estimation, on-chain errors)
@@ -277,6 +387,8 @@ function canWrite(res: ServerResponse): boolean {
  */
 function safeWrite(res: ServerResponse, data: string | Buffer): boolean {
   if (!canWrite(res)) {
+    const bytes = typeof data === "string" ? Buffer.byteLength(data) : data.length;
+    console.warn(`[ClawRouter] safeWrite: socket not writable, dropping ${bytes} bytes`);
     return false;
   }
   return res.write(data);
@@ -1372,15 +1484,9 @@ async function proxyPartnerRequest(
 
   // Stream response body
   if (upstream.body) {
-    const reader = upstream.body.getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        safeWrite(res, Buffer.from(value));
-      }
-    } finally {
-      reader.releaseLock();
+    const chunks = await readBodyWithTimeout(upstream.body, ERROR_BODY_READ_TIMEOUT_MS);
+    for (const chunk of chunks) {
+      safeWrite(res, Buffer.from(chunk));
     }
   }
 
@@ -1422,17 +1528,24 @@ async function uploadDataUriToHost(dataUri: string): Promise<string> {
   form.append("reqtype", "fileupload");
   form.append("fileToUpload", blob, `image.${ext}`);
 
-  const resp = await fetch("https://catbox.moe/user/api.php", {
-    method: "POST",
-    body: form,
-  });
+  const uploadController = new AbortController();
+  const uploadTimeout = setTimeout(() => uploadController.abort(), 30_000);
+  try {
+    const resp = await fetch("https://catbox.moe/user/api.php", {
+      method: "POST",
+      body: form,
+      signal: uploadController.signal,
+    });
 
-  if (!resp.ok) throw new Error(`catbox.moe upload failed: HTTP ${resp.status}`);
-  const result = await resp.text();
-  if (result.startsWith("https://")) {
-    return result.trim();
+    if (!resp.ok) throw new Error(`catbox.moe upload failed: HTTP ${resp.status}`);
+    const result = await resp.text();
+    if (result.startsWith("https://")) {
+      return result.trim();
+    }
+    throw new Error(`catbox.moe upload failed: ${result}`);
+  } finally {
+    clearTimeout(uploadTimeout);
   }
-  throw new Error(`catbox.moe upload failed: ${result}`);
 }
 
 /**
@@ -1457,8 +1570,12 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
     (paymentChain === "solana" && solanaPrivateKeyBytes ? BLOCKRUN_SOLANA_API : BLOCKRUN_API);
   if (paymentChain === "solana" && !solanaPrivateKeyBytes) {
     console.warn(
-      `[ClawRouter] Payment chain is Solana but no Solana keys provided. Using Base (EVM).`,
+      `[ClawRouter] ⚠ Payment chain is Solana but no mnemonic found — falling back to Base (EVM).`,
     );
+    console.warn(
+      `[ClawRouter]   To fix: run "npx @blockrun/clawrouter wallet recover" if your mnemonic exists,`,
+    );
+    console.warn(`[ClawRouter]   or run "npx @blockrun/clawrouter chain base" to switch to EVM.`);
   } else if (paymentChain === "solana") {
     console.log(`[ClawRouter] Payment chain: Solana (${BLOCKRUN_SOLANA_API})`);
   }
@@ -1545,7 +1662,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
     const solanaSigner = await createKeyPairSignerFromPrivateKeyBytes(solanaPrivateKeyBytes);
     solanaAddress = solanaSigner.address;
     registerExactSvmScheme(x402, { signer: solanaSigner });
-    console.log(`[ClawRouter] Solana x402 scheme registered: ${solanaAddress}`);
+    console.log(`[ClawRouter] Solana wallet: ${solanaAddress}`);
   }
 
   // Log which chain is used for each payment
@@ -1706,6 +1823,98 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       const models = buildProxyModelList();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ object: "list", data: models }));
+      return;
+    }
+
+    // --- Serve locally cached images (~/.openclaw/blockrun/images/) ---
+    if (req.url?.startsWith("/images/") && req.method === "GET") {
+      const filename = req.url
+        .slice("/images/".length)
+        .split("?")[0]!
+        .replace(/[^a-zA-Z0-9._-]/g, "");
+      if (!filename) {
+        res.writeHead(400);
+        res.end("Bad request");
+        return;
+      }
+      const filePath = join(IMAGE_DIR, filename);
+      try {
+        const s = await fsStat(filePath);
+        if (!s.isFile()) throw new Error("not a file");
+        const ext = filename.split(".").pop()?.toLowerCase() ?? "png";
+        const mime: Record<string, string> = {
+          png: "image/png",
+          jpg: "image/jpeg",
+          jpeg: "image/jpeg",
+          webp: "image/webp",
+          gif: "image/gif",
+        };
+        const data = await readFile(filePath);
+        res.writeHead(200, {
+          "Content-Type": mime[ext] ?? "application/octet-stream",
+          "Content-Length": data.length,
+        });
+        res.end(data);
+      } catch {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Image not found" }));
+      }
+      return;
+    }
+
+    // --- Handle /v1/images/generations: proxy with x402 payment + save data URIs locally ---
+    if (req.url === "/v1/images/generations" && req.method === "POST") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      const reqBody = Buffer.concat(chunks);
+      try {
+        const upstream = await payFetch(`${apiBase}/v1/images/generations`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "user-agent": USER_AGENT },
+          body: reqBody,
+        });
+        const text = await upstream.text();
+        if (!upstream.ok) {
+          res.writeHead(upstream.status, { "Content-Type": "application/json" });
+          res.end(text);
+          return;
+        }
+        let result: { created?: number; data?: Array<{ url?: string; revised_prompt?: string }> };
+        try {
+          result = JSON.parse(text);
+        } catch {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(text);
+          return;
+        }
+        // Save any data URIs to ~/.openclaw/blockrun/images/ and replace with localhost URLs
+        if (result.data?.length) {
+          await mkdir(IMAGE_DIR, { recursive: true });
+          const port = (server.address() as AddressInfo | null)?.port ?? 8402;
+          for (const img of result.data) {
+            const m = img.url?.match(/^data:(image\/\w+);base64,(.+)$/);
+            if (m) {
+              const [, mimeType, b64] = m;
+              const ext = mimeType === "image/jpeg" ? "jpg" : (mimeType!.split("/")[1] ?? "png");
+              const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+              await writeFile(join(IMAGE_DIR, filename), Buffer.from(b64!, "base64"));
+              img.url = `http://localhost:${port}/images/${filename}`;
+              console.log(`[ClawRouter] Image saved → ${img.url}`);
+            }
+          }
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[ClawRouter] Image generation error: ${msg}`);
+        if (!res.headersSent) {
+          res.writeHead(502, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Image generation failed", details: msg }));
+        }
+      }
       return;
     }
 
@@ -2043,7 +2252,8 @@ async function tryModelRequest(
     // Check for provider errors
     const contentType = response.headers.get("content-type") || "";
     if (response.status !== 200) {
-      const errorBody = await response.text();
+      const errorBodyChunks = await readBodyWithTimeout(response.body, ERROR_BODY_READ_TIMEOUT_MS);
+      const errorBody = Buffer.concat(errorBodyChunks).toString();
       const classification = classifyProviderFailure({
         status: response.status,
         body: errorBody,
@@ -2062,7 +2272,11 @@ async function tryModelRequest(
     // Detect provider degradation hidden inside HTTP 200 responses.
     if (contentType.includes("json") || contentType.includes("text") || contentType.includes("x-ndjson")) {
       try {
-        const responseBody = await response.clone().text();
+        const clonedChunks = await readBodyWithTimeout(
+          response.clone().body,
+          ERROR_BODY_READ_TIMEOUT_MS,
+        );
+        const responseBody = Buffer.concat(clonedChunks).toString();
         const classification = classifyProviderFailure({
           status: response.status,
           body: responseBody,
@@ -2080,6 +2294,16 @@ async function tryModelRequest(
             errorStatus: syntheticErrorStatus,
             isProviderError: classification.isProviderError,
             isRateLimited: classification.isRateLimited,
+          };
+        }
+
+        const degradedReason = detectDegradedSuccessResponse(responseBody);
+        if (degradedReason) {
+          return {
+            success: false,
+            errorBody: degradedReason,
+            errorStatus: 503,
+            isProviderError: true,
           };
         }
       } catch {
@@ -2560,11 +2784,14 @@ async function proxyRequest(
       const resolvedModel = resolveModelAlias(normalizedModel);
       const wasAlias = resolvedModel !== normalizedModel;
 
-      const isRoutingProfile = ROUTING_PROFILES.has(normalizedModel);
+      // Check both normalizedModel and resolvedModel — OpenClaw may send "openai/eco"
+      // which resolveModelAlias strips to "eco" (a valid routing profile)
+      const isRoutingProfile =
+        ROUTING_PROFILES.has(normalizedModel) || ROUTING_PROFILES.has(resolvedModel);
 
       // Extract routing profile type (free/eco/auto/premium)
       if (isRoutingProfile) {
-        const profileName = normalizedModel.replace("blockrun/", "");
+        const profileName = resolvedModel.replace("blockrun/", "");
         routingProfile = profileName as "free" | "eco" | "auto" | "premium";
       }
 
@@ -3141,14 +3368,31 @@ async function proxyRequest(
         // Track provider rate limits to deprioritize this model for future requests
         if ((result.errorStatus === 429) || result.isRateLimited) {
           markRateLimited(tryModel);
+          // Check for server-side update hint
+          try {
+            const parsed = JSON.parse(result.errorBody || "{}");
+            if (parsed.update_available) {
+              console.log("");
+              console.log(
+                `\x1b[33m⬆️  ClawRouter ${parsed.update_available} available (you have ${VERSION})\x1b[0m`,
+              );
+              console.log(
+                `   Run: \x1b[36mcurl -fsSL ${parsed.update_url || "https://blockrun.ai/ClawRouter-update"} | bash\x1b[0m`,
+              );
+              console.log("");
+            }
+          } catch {
+            /* ignore parse errors */
+          }
         }
 
         // Payment error (insufficient funds, simulation failure) — skip remaining
         // paid models, jump straight to free model. No point trying other paid
         // models with the same wallet state.
-        const isPaymentErr = /payment.*verification.*failed|payment.*settlement.*failed|insufficient.*funds|transaction_simulation_failed/i.test(
-          result.errorBody || "",
-        );
+        const isPaymentErr =
+          /payment.*verification.*failed|payment.*settlement.*failed|insufficient.*funds|transaction_simulation_failed/i.test(
+            result.errorBody || "",
+          );
         if (isPaymentErr && tryModel !== FREE_MODEL) {
           const freeIdx = modelsToTry.indexOf(FREE_MODEL);
           if (freeIdx > i + 1) {
@@ -3285,17 +3529,7 @@ async function proxyRequest(
       // OpenClaw expects: object="chat.completion.chunk" with choices[].delta (not message)
       // We emit proper incremental deltas to match OpenAI's streaming format exactly
       if (upstream.body) {
-        const reader = upstream.body.getReader();
-        const chunks: Uint8Array[] = [];
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-          }
-        } finally {
-          reader.releaseLock();
-        }
+        const chunks = await readBodyWithTimeout(upstream.body);
 
         // Combine chunks and transform to streaming format
         const jsonBody = Buffer.concat(chunks);
@@ -3488,15 +3722,9 @@ async function proxyRequest(
       // Collect full body for possible notice injection
       const bodyParts: Buffer[] = [];
       if (upstream.body) {
-        const reader = upstream.body.getReader();
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            bodyParts.push(Buffer.from(value));
-          }
-        } finally {
-          reader.releaseLock();
+        const chunks = await readBodyWithTimeout(upstream.body);
+        for (const chunk of chunks) {
+          bodyParts.push(Buffer.from(chunk));
         }
       }
 

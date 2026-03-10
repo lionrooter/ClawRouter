@@ -41,12 +41,20 @@ export class SolanaBalanceMonitor {
 
   async checkBalance(): Promise<SolanaBalanceInfo> {
     const now = Date.now();
-    if (this.cachedBalance !== null && now - this.cachedAt < CACHE_TTL_MS) {
+    if (
+      this.cachedBalance !== null &&
+      this.cachedBalance > 0n &&
+      now - this.cachedAt < CACHE_TTL_MS
+    ) {
       return this.buildInfo(this.cachedBalance);
     }
+    // Zero balance is never cached — always re-fetch so a funded wallet is
+    // detected on the next request without waiting for cache expiry.
     const balance = await this.fetchBalance();
-    this.cachedBalance = balance;
-    this.cachedAt = now;
+    if (balance > 0n) {
+      this.cachedBalance = balance;
+      this.cachedAt = now;
+    }
     return this.buildInfo(balance);
   }
 
@@ -98,6 +106,20 @@ export class SolanaBalanceMonitor {
     const owner = solAddress(this.walletAddress);
     const mint = solAddress(SOLANA_USDC_MINT);
 
+    // The public Solana RPC frequently returns empty token account lists even
+    // for funded wallets. Retry once on empty before accepting $0 as truth.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await this.fetchBalanceOnce(owner, mint);
+      if (result > 0n || attempt === 1) return result;
+      await new Promise((r) => setTimeout(r, 1_000));
+    }
+    return 0n;
+  }
+
+  private async fetchBalanceOnce(
+    owner: ReturnType<typeof solAddress>,
+    mint: ReturnType<typeof solAddress>,
+  ): Promise<bigint> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), BALANCE_TIMEOUT_MS);
 

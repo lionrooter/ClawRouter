@@ -111,6 +111,19 @@ export function resolveModelAlias(model: string): string {
     return withoutPrefix;
   }
 
+  // Strip "openai/" prefix when it wraps a virtual routing profile or alias.
+  // OpenClaw sends virtual models as "openai/eco", "openai/free", etc. because
+  // the provider uses the openai-completions API type.
+  if (normalized.startsWith("openai/")) {
+    const withoutPrefix = normalized.slice("openai/".length);
+    const resolvedWithoutPrefix = MODEL_ALIASES[withoutPrefix];
+    if (resolvedWithoutPrefix) return resolvedWithoutPrefix;
+
+    // If it's a known BlockRun virtual profile (eco, free, auto, premium), return bare id
+    const isVirtualProfile = BLOCKRUN_MODELS.some((m) => m.id === withoutPrefix);
+    if (isVirtualProfile) return withoutPrefix;
+  }
+
   return model;
 }
 

@@ -6,7 +6,6 @@
 import { VERSION } from "./version.js";
 
 const NPM_REGISTRY = "https://registry.npmjs.org/@blockrun/clawrouter/latest";
-const UPDATE_URL = "https://blockrun.ai/ClawRouter-update";
 const CHECK_TIMEOUT_MS = 5_000; // Don't block startup for more than 5s
 
 /**
@@ -50,7 +49,7 @@ export async function checkForUpdates(): Promise<void> {
     if (compareSemver(latest, VERSION) > 0) {
       console.log("");
       console.log(`\x1b[33m⬆️  ClawRouter ${latest} available (you have ${VERSION})\x1b[0m`);
-      console.log(`   Run: \x1b[36mcurl -fsSL ${UPDATE_URL} | bash\x1b[0m`);
+      console.log(`   Run: \x1b[36mnpx @blockrun/clawrouter@latest\x1b[0m`);
       console.log("");
     }
   } catch {

@@ -73,7 +73,12 @@ export function createPayFetchWithPreAuth(
       const getHeader = (name: string) => response.headers.get(name);
       let body: unknown;
       try {
-        const responseText = await response.text();
+        const responseText = await Promise.race([
+          response.text(),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("Body read timeout")), 30_000),
+          ),
+        ]);
         if (responseText) body = JSON.parse(responseText);
       } catch {
         /* empty body is fine */
