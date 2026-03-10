@@ -81,6 +81,7 @@ import { SessionJournal } from "./journal.js";
 
 const BLOCKRUN_API = "https://blockrun.ai/api";
 const BLOCKRUN_SOLANA_API = "https://sol.blockrun.ai/api";
+const LOCAL_CLI_PROXY_API = "http://127.0.0.1:11435";
 // Routing profile models - virtual models that trigger intelligent routing
 const AUTO_MODEL = "blockrun/auto";
 
@@ -421,6 +422,29 @@ type ProviderFailureClassification = {
 
 function anyPatternMatch(message: string, patterns: RegExp[]): boolean {
   return patterns.some((pattern) => pattern.test(message));
+}
+
+export function usesLocalCliProxy(modelId: string): boolean {
+  const normalized = String(modelId || "").trim().toLowerCase();
+  return (
+    normalized === "local" ||
+    normalized.startsWith("local/") ||
+    normalized === "exo" ||
+    normalized.startsWith("exo/") ||
+    normalized === "tool-local" ||
+    normalized.startsWith("tool-local/") ||
+    normalized.startsWith("ollama/") ||
+    normalized === "codex" ||
+    normalized.startsWith("codex/") ||
+    normalized.startsWith("claude-cli/")
+  );
+}
+
+export function resolveModelDispatchUrl(upstreamUrl: string, modelId: string): string {
+  if (!usesLocalCliProxy(modelId)) {
+    return upstreamUrl;
+  }
+  return new URL("/v1/chat/completions", LOCAL_CLI_PROXY_API).toString();
 }
 
 function looksLikeSse(body: string): boolean {
@@ -2002,7 +2026,14 @@ async function tryModelRequest(
   }
 
   try {
-    const response = await payFetch(upstreamUrl, {
+    const dispatchUrl = resolveModelDispatchUrl(upstreamUrl, modelId);
+    const useLocalProxy = dispatchUrl !== upstreamUrl;
+    if (useLocalProxy) {
+      console.log(`[ClawRouter] Dispatching ${modelId} via local CLI proxy: ${dispatchUrl}`);
+    }
+
+    const requestFn = useLocalProxy ? fetch : payFetch;
+    const response = await requestFn(dispatchUrl, {
       method,
       headers,
       body: requestBody.length > 0 ? new Uint8Array(requestBody) : undefined,

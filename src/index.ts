@@ -71,6 +71,149 @@ import { getStats, formatStatsAscii, clearStats } from "./stats.js";
 import { buildPartnerTools, PARTNER_SERVICES } from "./partners/index.js";
 
 /**
+ * Internal helper: call local memory-agent service and normalize response handling.
+ */
+async function callMemoryAgent<T = unknown>(
+  baseUrl: string,
+  path: string,
+  init: RequestInit = {},
+): Promise<T> {
+  const res = await fetch(`${baseUrl.replace(/\/$/, "")}${path}`, {
+    headers: {
+      ...(init.headers ?? {}),
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+    },
+    ...init,
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`memory-agent HTTP ${res.status} ${res.statusText}: ${body || "(empty)"}`);
+  }
+
+  const text = await res.text();
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return { value: text } as T;
+  }
+}
+
+function getMemoryAgentBaseUrl(): string {
+  const configured = process["env"].OPENCLAW_MEMORY_AGENT_BASE_URL;
+  if (configured && configured.trim()) {
+    return configured.trim();
+  }
+  const legacyPort = process["env"].OPENCLAW_MEMORY_AGENT_PORT;
+  if (legacyPort && legacyPort.trim()) {
+    return `http://127.0.0.1:${legacyPort.trim()}`;
+  }
+  return "http://127.0.0.1:8888";
+}
+
+function buildMemoryAgentTools(memoryAgentBaseUrl: string) {
+  return [
+    {
+      name: "memory_agent_query",
+      description:
+        "Ask a question against the always-on memory store (returns concise answer with memory references).",
+      parameters: {
+        type: "object",
+        properties: {
+          question: { type: "string", description: "Question to answer from stored memories." },
+        },
+        required: ["question"],
+      },
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const question = String(params.question ?? "").trim();
+        if (!question) {
+          throw new Error("memory_agent_query requires 'question'");
+        }
+        const encoded = encodeURIComponent(question);
+        const response = await callMemoryAgent(memoryAgentBaseUrl, `/query?q=${encoded}`, {
+          method: "GET",
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+          details: response,
+        };
+      },
+    },
+    {
+      name: "memory_agent_ingest",
+      description: "Store a new memory text snippet in the always-on memory agent.",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string", description: "What to remember." },
+          source: { type: "string", description: "Optional source tag for this memory." },
+        },
+        required: ["text"],
+      },
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const text = String(params.text ?? "").trim();
+        if (!text) {
+          throw new Error("memory_agent_ingest requires non-empty 'text'");
+        }
+        const source = String(params.source ?? "openclaw");
+        const response = await callMemoryAgent(memoryAgentBaseUrl, "/ingest", {
+          method: "POST",
+          body: JSON.stringify({ text, source }),
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+          details: response,
+        };
+      },
+    },
+    {
+      name: "memory_agent_status",
+      description: "Read stats from the always-on memory agent.",
+      parameters: { type: "object", properties: {}, required: [] },
+      execute: async () => {
+        const response = await callMemoryAgent(memoryAgentBaseUrl, "/status", { method: "GET" });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+          details: response,
+        };
+      },
+    },
+    {
+      name: "memory_agent_list",
+      description: "List latest stored memories with IDs and summaries.",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+      },
+      execute: async (_toolCallId: string, _params: Record<string, unknown>) => {
+        const response = await callMemoryAgent(memoryAgentBaseUrl, "/memories", {
+          method: "GET",
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+          details: response,
+        };
+      },
+    },
+    {
+      name: "memory_agent_consolidate",
+      description: "Force one memory consolidation pass.",
+      parameters: { type: "object", properties: {}, required: [] },
+      execute: async () => {
+        const response = await callMemoryAgent(memoryAgentBaseUrl, "/consolidate", {
+          method: "POST",
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+          details: response,
+        };
+      },
+    },
+  ];
+}
+
+/**
  * Detect if we're running in shell completion mode.
  * When `openclaw completion --shell zsh` runs, it loads plugins but only needs
  * the completion script output - any stdout logging pollutes the script and
@@ -950,6 +1093,20 @@ const plugin: OpenClawPluginDefinition = {
         );
       }
 
+      // Register local always-on memory tools (if any): query, ingest, status, list, consolidate.
+      const memoryAgentBaseUrl = getMemoryAgentBaseUrl();
+      const memoryTools = buildMemoryAgentTools(memoryAgentBaseUrl);
+      for (const tool of memoryTools) {
+        api.registerTool(tool);
+      }
+      if (memoryTools.length > 0) {
+        api.logger.info(
+          `Registered ${memoryTools.length} memory tool(s): ${memoryTools
+            .map((t) => t.name)
+            .join(", ")} (base ${memoryAgentBaseUrl})`,
+        );
+      }
+
       // Register /partners command
       api.registerCommand({
         name: "partners",
@@ -977,6 +1134,90 @@ const plugin: OpenClawPluginDefinition = {
           }
 
           return { text: lines.join("\n") };
+        },
+      });
+
+      // Register /memory-agent command for direct operational checks and ad-hoc actions.
+      api.registerCommand({
+        name: "memory-agent",
+        description: "Inspect or operate the local always-on memory agent",
+        acceptsArgs: true,
+        requireAuth: false,
+        handler: async (ctx: PluginCommandContext) => {
+          const raw = ctx.args?.trim() || "status";
+          const [subCommand, ...rest] = raw.split(/\s+/);
+          const baseUrl = getMemoryAgentBaseUrl();
+          const text = rest.join(" ").trim();
+
+          try {
+            switch ((subCommand || "status").toLowerCase()) {
+              case "help":
+                return {
+                  text: [
+                    "**memory-agent**",
+                    `Service base URL: ${baseUrl}`,
+                    "",
+                    "Commands:",
+                    "• `status` - agent stats",
+                    "• `query <question>` - ask memory",
+                    "• `ingest <text>` - store a memory",
+                    "• `consolidate` - run consolidation",
+                    "• `memories` - list latest memories",
+                    "",
+                    "Set OPENCLAW_MEMORY_AGENT_BASE_URL to change endpoint (default: http://127.0.0.1:8888).",
+                  ].join("\n"),
+                };
+              case "query": {
+                if (!text) {
+                  return { text: "Usage: /memory-agent query <question>", isError: true };
+                }
+                const response = await callMemoryAgent(
+                  baseUrl,
+                  `/query?q=${encodeURIComponent(text)}`,
+                  { method: "GET" },
+                );
+                return {
+                  text: `**Question:** ${text}\n\n\`\`\`json\n${JSON.stringify(response, null, 2)}\n\`\`\``,
+                };
+              }
+              case "ingest": {
+                if (!text) {
+                  return { text: "Usage: /memory-agent ingest <text>", isError: true };
+                }
+                const response = await callMemoryAgent(baseUrl, "/ingest", {
+                  method: "POST",
+                  body: JSON.stringify({ text, source: "openclaw-router-command" }),
+                });
+                return { text: JSON.stringify(response, null, 2) };
+              }
+              case "memories": {
+                const response = await callMemoryAgent(baseUrl, "/memories", { method: "GET" });
+                return { text: JSON.stringify(response, null, 2) };
+              }
+              case "consolidate": {
+                const response = await callMemoryAgent(baseUrl, "/consolidate", {
+                  method: "POST",
+                });
+                return { text: JSON.stringify(response, null, 2) };
+              }
+              case "status":
+              default: {
+                const response = await callMemoryAgent(baseUrl, "/status", { method: "GET" });
+                return {
+                  text: `\`\`\`json\n${JSON.stringify(response, null, 2)}\n\`\`\``,
+                };
+              }
+            }
+          } catch (err) {
+                return {
+                  text: [
+                    `Failed to call memory agent at ${baseUrl}.`,
+                    `Error: ${err instanceof Error ? err.message : String(err)}`,
+                    "Start the service with: `python generative-ai/gemini/agents/always-on-memory-agent/agent.py --watch <inbox> --port 8888`",
+                  ].join("\n"),
+                  isError: true,
+                };
+          }
         },
       });
     } catch (err) {
