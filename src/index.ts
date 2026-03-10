@@ -25,7 +25,14 @@ import type {
 } from "./types.js";
 import { blockrunProvider, setActiveProxy } from "./provider.js";
 import { startProxy, getProxyPort } from "./proxy.js";
-import { resolveOrGenerateWalletKey, WALLET_FILE } from "./auth.js";
+import {
+  resolveOrGenerateWalletKey,
+  setupSolana,
+  savePaymentChain,
+  resolvePaymentChain,
+  WALLET_FILE,
+  MNEMONIC_FILE,
+} from "./auth.js";
 import type { RoutingConfig } from "./router/index.js";
 import { BalanceMonitor } from "./balance.js";
 
@@ -60,7 +67,151 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { VERSION } from "./version.js";
 import { privateKeyToAccount } from "viem/accounts";
-import { getStats, formatStatsAscii } from "./stats.js";
+import { getStats, formatStatsAscii, clearStats } from "./stats.js";
+import { buildPartnerTools, PARTNER_SERVICES } from "./partners/index.js";
+
+/**
+ * Internal helper: call local memory-agent service and normalize response handling.
+ */
+async function callMemoryAgent<T = unknown>(
+  baseUrl: string,
+  path: string,
+  init: RequestInit = {},
+): Promise<T> {
+  const res = await fetch(`${baseUrl.replace(/\/$/, "")}${path}`, {
+    headers: {
+      ...(init.headers ?? {}),
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+    },
+    ...init,
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`memory-agent HTTP ${res.status} ${res.statusText}: ${body || "(empty)"}`);
+  }
+
+  const text = await res.text();
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return { value: text } as T;
+  }
+}
+
+function getMemoryAgentBaseUrl(): string {
+  const configured = process["env"].OPENCLAW_MEMORY_AGENT_BASE_URL;
+  if (configured && configured.trim()) {
+    return configured.trim();
+  }
+  const legacyPort = process["env"].OPENCLAW_MEMORY_AGENT_PORT;
+  if (legacyPort && legacyPort.trim()) {
+    return `http://127.0.0.1:${legacyPort.trim()}`;
+  }
+  return "http://127.0.0.1:8888";
+}
+
+function buildMemoryAgentTools(memoryAgentBaseUrl: string) {
+  return [
+    {
+      name: "memory_agent_query",
+      description:
+        "Ask a question against the always-on memory store (returns concise answer with memory references).",
+      parameters: {
+        type: "object",
+        properties: {
+          question: { type: "string", description: "Question to answer from stored memories." },
+        },
+        required: ["question"],
+      },
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const question = String(params.question ?? "").trim();
+        if (!question) {
+          throw new Error("memory_agent_query requires 'question'");
+        }
+        const encoded = encodeURIComponent(question);
+        const response = await callMemoryAgent(memoryAgentBaseUrl, `/query?q=${encoded}`, {
+          method: "GET",
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+          details: response,
+        };
+      },
+    },
+    {
+      name: "memory_agent_ingest",
+      description: "Store a new memory text snippet in the always-on memory agent.",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string", description: "What to remember." },
+          source: { type: "string", description: "Optional source tag for this memory." },
+        },
+        required: ["text"],
+      },
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const text = String(params.text ?? "").trim();
+        if (!text) {
+          throw new Error("memory_agent_ingest requires non-empty 'text'");
+        }
+        const source = String(params.source ?? "openclaw");
+        const response = await callMemoryAgent(memoryAgentBaseUrl, "/ingest", {
+          method: "POST",
+          body: JSON.stringify({ text, source }),
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+          details: response,
+        };
+      },
+    },
+    {
+      name: "memory_agent_status",
+      description: "Read stats from the always-on memory agent.",
+      parameters: { type: "object", properties: {}, required: [] },
+      execute: async () => {
+        const response = await callMemoryAgent(memoryAgentBaseUrl, "/status", { method: "GET" });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+          details: response,
+        };
+      },
+    },
+    {
+      name: "memory_agent_list",
+      description: "List latest stored memories with IDs and summaries.",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+      },
+      execute: async (_toolCallId: string, _params: Record<string, unknown>) => {
+        const response = await callMemoryAgent(memoryAgentBaseUrl, "/memories", {
+          method: "GET",
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+          details: response,
+        };
+      },
+    },
+    {
+      name: "memory_agent_consolidate",
+      description: "Force one memory consolidation pass.",
+      parameters: { type: "object", properties: {}, required: [] },
+      execute: async () => {
+        const response = await callMemoryAgent(memoryAgentBaseUrl, "/consolidate", {
+          method: "POST",
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+          details: response,
+        };
+      },
+    },
+  ];
+}
 
 /**
  * Detect if we're running in shell completion mode.
@@ -252,64 +403,52 @@ function injectModelsConfig(logger: { info: (msg: string) => void }): void {
     needsWrite = true;
   }
 
-  // Add key model aliases to allowlist for /model picker visibility
-  // Only add essential aliases, not all 50+ models to avoid config pollution
-  const KEY_MODEL_ALIASES = [
-    { id: "auto", alias: "auto" },
-    { id: "eco", alias: "eco" },
-    { id: "premium", alias: "premium" },
-    { id: "free", alias: "free" },
-    { id: "sonnet", alias: "sonnet-4.6" },
-    { id: "opus", alias: "opus" },
-    { id: "haiku", alias: "haiku" },
-    { id: "gpt5", alias: "gpt5" },
-    { id: "codex", alias: "codex" },
-    { id: "grok-fast", alias: "grok-fast" },
-    { id: "grok-code", alias: "grok-code" },
-    { id: "deepseek", alias: "deepseek" },
-    { id: "reasoner", alias: "reasoner" },
-    { id: "kimi", alias: "kimi" },
-    { id: "minimax", alias: "minimax" },
-    { id: "gemini", alias: "gemini" },
+  // Populate agents.defaults.models (the allowlist) with top BlockRun models.
+  // OpenClaw uses this as a whitelist — only listed models appear in the /model picker.
+  // We show the 16 most popular models to keep the picker clean.
+  // Existing non-blockrun entries are preserved (e.g. from other providers).
+  const TOP_MODELS = [
+    "auto",
+    "free",
+    "eco",
+    "premium",
+    "anthropic/claude-sonnet-4.6",
+    "anthropic/claude-opus-4.6",
+    "anthropic/claude-haiku-4.5",
+    "openai/gpt-5.2",
+    "openai/gpt-4o",
+    "openai/o3",
+    "google/gemini-3.1-pro",
+    "google/gemini-3-flash-preview",
+    "deepseek/deepseek-chat",
+    "moonshot/kimi-k2.5",
+    "xai/grok-3",
+    "minimax/minimax-m2.5",
   ];
-
-  // Deprecated aliases to remove from config (cleaned up from picker)
-  const DEPRECATED_ALIASES = [
-    "blockrun/nvidia",
-    "blockrun/gpt",
-    "blockrun/o3",
-    "blockrun/grok",
-    "blockrun/mini",
-    "blockrun/flash", // removed from picker - use gemini instead
-  ];
-
-  if (!defaults.models) {
+  if (!defaults.models || typeof defaults.models !== "object" || Array.isArray(defaults.models)) {
     defaults.models = {};
     needsWrite = true;
   }
-
   const allowlist = defaults.models as Record<string, unknown>;
-
-  // Remove deprecated aliases from config
-  for (const deprecated of DEPRECATED_ALIASES) {
-    if (allowlist[deprecated]) {
-      delete allowlist[deprecated];
-      logger.info(`Removed deprecated model alias: ${deprecated}`);
+  // Clean out old blockrun entries that aren't in TOP_MODELS (from previous versions)
+  const topSet = new Set(TOP_MODELS.map((id) => `blockrun/${id}`));
+  for (const key of Object.keys(allowlist)) {
+    if (key.startsWith("blockrun/") && !topSet.has(key)) {
+      delete allowlist[key];
       needsWrite = true;
     }
   }
-
-  // Add current aliases (and update stale aliases)
-  for (const m of KEY_MODEL_ALIASES) {
-    const fullId = `blockrun/${m.id}`;
-    const existing = allowlist[fullId] as Record<string, unknown> | undefined;
-    if (!existing) {
-      allowlist[fullId] = { alias: m.alias };
-      needsWrite = true;
-    } else if (existing.alias !== m.alias) {
-      existing.alias = m.alias;
-      needsWrite = true;
+  let addedCount = 0;
+  for (const id of TOP_MODELS) {
+    const key = `blockrun/${id}`;
+    if (!allowlist[key]) {
+      allowlist[key] = {};
+      addedCount++;
     }
+  }
+  if (addedCount > 0) {
+    needsWrite = true;
+    logger.info(`Added ${addedCount} models to allowlist (${TOP_MODELS.length} total)`);
   }
 
   // Write config file if any changes were made
@@ -428,27 +567,27 @@ let activeProxyHandle: Awaited<ReturnType<typeof startProxy>> | null = null;
  */
 async function startProxyInBackground(api: OpenClawPluginApi): Promise<void> {
   // Resolve wallet key: saved file → env var → auto-generate
-  const { key: walletKey, address, source } = await resolveOrGenerateWalletKey();
+  const wallet = await resolveOrGenerateWalletKey();
 
   // Log wallet source
-  if (source === "generated") {
+  if (wallet.source === "generated") {
     api.logger.warn(`════════════════════════════════════════════════`);
     api.logger.warn(`  NEW WALLET GENERATED — BACK UP YOUR KEY NOW!`);
-    api.logger.warn(`  Address : ${address}`);
+    api.logger.warn(`  Address : ${wallet.address}`);
     api.logger.warn(`  Run /wallet export to get your private key`);
     api.logger.warn(`  Losing this key = losing your USDC funds`);
     api.logger.warn(`════════════════════════════════════════════════`);
-  } else if (source === "saved") {
-    api.logger.info(`Using saved wallet: ${address}`);
+  } else if (wallet.source === "saved") {
+    api.logger.info(`Using saved wallet: ${wallet.address}`);
   } else {
-    api.logger.info(`Using wallet from BLOCKRUN_WALLET_KEY: ${address}`);
+    api.logger.info(`Using wallet from BLOCKRUN_WALLET_KEY: ${wallet.address}`);
   }
 
   // Resolve routing config overrides from plugin config
   const routingConfig = api.pluginConfig?.routing as Partial<RoutingConfig> | undefined;
 
   const proxy = await startProxy({
-    walletKey,
+    wallet,
     routingConfig,
     onReady: (port) => {
       api.logger.info(`BlockRun x402 proxy listening on port ${port}`);
@@ -480,22 +619,25 @@ async function startProxyInBackground(api: OpenClawPluginApi): Promise<void> {
   api.logger.info(`Pricing: Simple ~$0.001 | Code ~$0.01 | Complex ~$0.05 | Free: $0`);
 
   // Non-blocking balance check AFTER proxy is ready (won't hang startup)
-  const startupMonitor = new BalanceMonitor(address);
-  startupMonitor
+  // Uses the proxy's chain-aware balance monitor and matching active-chain address.
+  const currentChain = await resolvePaymentChain();
+  const displayAddress =
+    currentChain === "solana" && proxy.solanaAddress ? proxy.solanaAddress : wallet.address;
+  proxy.balanceMonitor
     .checkBalance()
     .then((balance) => {
       if (balance.isEmpty) {
-        api.logger.info(`Wallet: ${address} | Balance: $0.00`);
+        api.logger.info(`Wallet: ${displayAddress} | Balance: $0.00`);
         api.logger.info(`Using FREE model. Fund wallet for premium models.`);
       } else if (balance.isLow) {
-        api.logger.info(`Wallet: ${address} | Balance: ${balance.balanceUSD} (low)`);
+        api.logger.info(`Wallet: ${displayAddress} | Balance: ${balance.balanceUSD} (low)`);
       } else {
-        api.logger.info(`Wallet: ${address} | Balance: ${balance.balanceUSD}`);
+        api.logger.info(`Wallet: ${displayAddress} | Balance: ${balance.balanceUSD}`);
       }
     })
     .catch(() => {
       // Silently continue - balance will be checked per-request anyway
-      api.logger.info(`Wallet: ${address} | Balance: (checking...)`);
+      api.logger.info(`Wallet: ${displayAddress} | Balance: (checking...)`);
     });
 }
 
@@ -511,6 +653,21 @@ async function createStatsCommand(): Promise<OpenClawPluginCommandDefinition> {
     requireAuth: false,
     handler: async (ctx: PluginCommandContext) => {
       const arg = ctx.args?.trim().toLowerCase() || "7";
+
+      if (arg === "clear" || arg === "reset") {
+        try {
+          const { deletedFiles } = await clearStats();
+          return {
+            text: `Stats cleared — ${deletedFiles} log file(s) deleted. Fresh start!`,
+          };
+        } catch (err) {
+          return {
+            text: `Failed to clear stats: ${err instanceof Error ? err.message : String(err)}`,
+            isError: true,
+          };
+        }
+      }
+
       const days = parseInt(arg, 10) || 7;
 
       try {
@@ -567,52 +724,305 @@ async function createWalletCommand(): Promise<OpenClawPluginCommandDefinition> {
       }
 
       if (subcommand === "export") {
-        // Export private key for backup
-        return {
-          text: [
-            "🔐 **ClawRouter Wallet Export**",
-            "",
-            "⚠️ **SECURITY WARNING**: Your private key controls your wallet funds.",
-            "Never share this key. Anyone with this key can spend your USDC.",
-            "",
-            `**Address:** \`${address}\``,
-            "",
-            `**Private Key:**`,
-            `\`${walletKey}\``,
-            "",
-            "**To restore on a new machine:**",
-            "1. Set the environment variable before running OpenClaw:",
-            `   \`export BLOCKRUN_WALLET_KEY=${walletKey}\``,
-            "2. Or save to file:",
-            `   \`mkdir -p ~/.openclaw/blockrun && echo "${walletKey}" > ~/.openclaw/blockrun/wallet.key && chmod 600 ~/.openclaw/blockrun/wallet.key\``,
-          ].join("\n"),
-        };
+        // Export private key + mnemonic for backup
+        const lines = [
+          "**ClawRouter Wallet Export**",
+          "",
+          "**SECURITY WARNING**: Your private key and mnemonic control your wallet funds.",
+          "Never share these. Anyone with them can spend your USDC.",
+          "",
+          "**EVM (Base):**",
+          `  Address: \`${address}\``,
+          `  Private Key: \`${walletKey}\``,
+        ];
+
+        // Include mnemonic if it exists (Solana wallet derived from it)
+        let hasMnemonic = false;
+        try {
+          if (existsSync(MNEMONIC_FILE)) {
+            const mnemonic = readTextFileSync(MNEMONIC_FILE).trim();
+            if (mnemonic) {
+              hasMnemonic = true;
+              // Derive Solana address for display
+              const { deriveSolanaKeyBytes } = await import("./wallet.js");
+              const solKeyBytes = deriveSolanaKeyBytes(mnemonic);
+              const { createKeyPairSignerFromPrivateKeyBytes } = await import("@solana/kit");
+              const signer = await createKeyPairSignerFromPrivateKeyBytes(solKeyBytes);
+
+              lines.push(
+                "",
+                "**Solana:**",
+                `  Address: \`${signer.address}\``,
+                `  (Derived from mnemonic below)`,
+                "",
+                "**Mnemonic (24 words):**",
+                `\`${mnemonic}\``,
+                "",
+                "CRITICAL: Back up this mnemonic. It is the ONLY way to recover your Solana wallet.",
+              );
+            }
+          }
+        } catch {
+          // No mnemonic - EVM-only wallet
+        }
+
+        lines.push(
+          "",
+          "**To restore on a new machine:**",
+          "1. Set the environment variable before running OpenClaw:",
+          `   \`export BLOCKRUN_WALLET_KEY=${walletKey}\``,
+          "2. Or save to file:",
+          `   \`mkdir -p ~/.openclaw/blockrun && echo "${walletKey}" > ~/.openclaw/blockrun/wallet.key && chmod 600 ~/.openclaw/blockrun/wallet.key\``,
+        );
+
+        if (hasMnemonic) {
+          lines.push(
+            "3. Restore the mnemonic for Solana:",
+            `   \`echo "<your mnemonic>" > ~/.openclaw/blockrun/mnemonic && chmod 600 ~/.openclaw/blockrun/mnemonic\``,
+          );
+        }
+
+        return { text: lines.join("\n") };
+      }
+
+      if (subcommand === "solana") {
+        // Switch to Solana chain. If mnemonic already exists, just persist the selection.
+        // If no mnemonic, set up Solana wallet first.
+        try {
+          let solanaAddr: string | undefined;
+
+          // Check if Solana wallet is already set up (mnemonic exists)
+          if (existsSync(MNEMONIC_FILE)) {
+            const existingMnemonic = readTextFileSync(MNEMONIC_FILE).trim();
+            if (existingMnemonic) {
+              // Already set up — just switch chain
+              await savePaymentChain("solana");
+              const { deriveSolanaKeyBytes } = await import("./wallet.js");
+              const solKeyBytes = deriveSolanaKeyBytes(existingMnemonic);
+              const { createKeyPairSignerFromPrivateKeyBytes } = await import("@solana/kit");
+              const signer = await createKeyPairSignerFromPrivateKeyBytes(solKeyBytes);
+              solanaAddr = signer.address;
+              return {
+                text: [
+                  "Payment chain set to Solana. Restart the gateway to apply.",
+                  "",
+                  `**Solana Address:** \`${solanaAddr}\``,
+                  `**Fund with USDC on Solana:** https://solscan.io/account/${solanaAddr}`,
+                ].join("\n"),
+              };
+            }
+          }
+
+          // No mnemonic — first-time Solana setup
+          const { solanaPrivateKeyBytes } = await setupSolana();
+          await savePaymentChain("solana");
+          const { createKeyPairSignerFromPrivateKeyBytes } = await import("@solana/kit");
+          const signer = await createKeyPairSignerFromPrivateKeyBytes(solanaPrivateKeyBytes);
+          return {
+            text: [
+              "**Solana Wallet Set Up**",
+              "",
+              `**Solana Address:** \`${signer.address}\``,
+              `**Mnemonic File:** \`${MNEMONIC_FILE}\``,
+              "",
+              "Your existing EVM wallet is unchanged.",
+              "Payment chain set to Solana. Restart the gateway to apply.",
+              "",
+              `**Fund with USDC on Solana:** https://solscan.io/account/${signer.address}`,
+            ].join("\n"),
+          };
+        } catch (err) {
+          return {
+            text: `Failed to set up Solana: ${err instanceof Error ? err.message : String(err)}`,
+            isError: true,
+          };
+        }
+      }
+
+      if (subcommand === "migrate-solana") {
+        // Sweep USDC from legacy (secp256k1) wallet to new (SLIP-10) wallet
+        try {
+          if (!existsSync(MNEMONIC_FILE)) {
+            return {
+              text: "No mnemonic file found. Solana wallet not set up — nothing to migrate.",
+              isError: true,
+            };
+          }
+
+          const mnemonic = readTextFileSync(MNEMONIC_FILE).trim();
+          if (!mnemonic) {
+            return { text: "Mnemonic file is empty.", isError: true };
+          }
+
+          const { deriveSolanaKeyBytes, deriveSolanaKeyBytesLegacy } = await import("./wallet.js");
+          const { createKeyPairSignerFromPrivateKeyBytes } = await import("@solana/kit");
+
+          const legacyKeyBytes = deriveSolanaKeyBytesLegacy(mnemonic);
+          const newKeyBytes = deriveSolanaKeyBytes(mnemonic);
+
+          const [oldSigner, newSigner] = await Promise.all([
+            createKeyPairSignerFromPrivateKeyBytes(legacyKeyBytes),
+            createKeyPairSignerFromPrivateKeyBytes(newKeyBytes),
+          ]);
+
+          if (oldSigner.address === newSigner.address) {
+            return { text: "Legacy and new Solana addresses are the same. No migration needed." };
+          }
+
+          // Check old wallet balance before attempting sweep
+          let oldUsdcText = "unknown";
+          try {
+            const { SolanaBalanceMonitor } = await import("./solana-balance.js");
+            const monitor = new SolanaBalanceMonitor(oldSigner.address);
+            const balance = await monitor.checkBalance();
+            oldUsdcText = balance.balanceUSD;
+
+            if (balance.isEmpty) {
+              return {
+                text: [
+                  "**Solana Migration Status**",
+                  "",
+                  `Old wallet (secp256k1): \`${oldSigner.address}\``,
+                  `  USDC: $0.00`,
+                  "",
+                  `New wallet (SLIP-10): \`${newSigner.address}\``,
+                  "",
+                  "No USDC in old wallet. Nothing to sweep.",
+                  "Your new SLIP-10 address is Phantom/Solflare compatible.",
+                ].join("\n"),
+              };
+            }
+          } catch {
+            // Continue — sweep function will also check balance
+          }
+
+          // Attempt sweep (new wallet pays gas — users can fund it via Phantom)
+          const { sweepSolanaWallet } = await import("./solana-sweep.js");
+          const result = await sweepSolanaWallet(legacyKeyBytes, newKeyBytes);
+
+          if ("error" in result) {
+            return {
+              text: [
+                "**Solana Migration Failed**",
+                "",
+                `Old wallet: \`${result.oldAddress}\` (USDC: ${oldUsdcText})`,
+                `New wallet: \`${result.newAddress || newSigner.address}\``,
+                "",
+                `Error: ${result.error}`,
+              ].join("\n"),
+              isError: true,
+            };
+          }
+
+          return {
+            text: [
+              "**Solana Migration Complete**",
+              "",
+              `Swept **${result.transferred}** USDC from old to new wallet.`,
+              "",
+              `Old wallet: \`${result.oldAddress}\``,
+              `New wallet: \`${result.newAddress}\``,
+              `TX: https://solscan.io/tx/${result.txSignature}`,
+              "",
+              "Your new SLIP-10 address is Phantom/Solflare compatible.",
+              "You can recover it from your 24-word mnemonic in any standard wallet.",
+            ].join("\n"),
+          };
+        } catch (err) {
+          return {
+            text: `Migration failed: ${err instanceof Error ? err.message : String(err)}`,
+            isError: true,
+          };
+        }
+      }
+
+      if (subcommand === "base") {
+        // Switch back to Base (EVM) payment chain
+        try {
+          await savePaymentChain("base");
+          return {
+            text: "Payment chain set to Base (EVM). Restart the gateway to apply.",
+          };
+        } catch (err) {
+          return {
+            text: `Failed to set payment chain: ${err instanceof Error ? err.message : String(err)}`,
+            isError: true,
+          };
+        }
       }
 
       // Default: show wallet status
-      let balanceText = "Balance: (checking...)";
+      let evmBalanceText: string;
       try {
         const monitor = new BalanceMonitor(address);
         const balance = await monitor.checkBalance();
-        balanceText = `Balance: ${balance.balanceUSD}`;
+        evmBalanceText = `Balance: ${balance.balanceUSD}`;
       } catch {
-        balanceText = "Balance: (could not check)";
+        evmBalanceText = "Balance: (could not check)";
       }
+
+      // Check for Solana wallet
+      let solanaSection = "";
+      try {
+        if (existsSync(MNEMONIC_FILE)) {
+          const { deriveSolanaKeyBytes } = await import("./wallet.js");
+          const mnemonic = readTextFileSync(MNEMONIC_FILE).trim();
+          if (mnemonic) {
+            const solKeyBytes = deriveSolanaKeyBytes(mnemonic);
+            const { createKeyPairSignerFromPrivateKeyBytes } = await import("@solana/kit");
+            const signer = await createKeyPairSignerFromPrivateKeyBytes(solKeyBytes);
+            const solAddr = signer.address;
+
+            let solBalanceText = "Balance: (checking...)";
+            try {
+              const { SolanaBalanceMonitor } = await import("./solana-balance.js");
+              const solMonitor = new SolanaBalanceMonitor(solAddr);
+              const solBalance = await solMonitor.checkBalance();
+              solBalanceText = `Balance: ${solBalance.balanceUSD}`;
+            } catch {
+              solBalanceText = "Balance: (could not check)";
+            }
+
+            solanaSection = [
+              "",
+              "**Solana:**",
+              `  Address: \`${solAddr}\``,
+              `  ${solBalanceText}`,
+              `  Fund: https://solscan.io/account/${solAddr}`,
+            ].join("\n");
+          }
+        }
+      } catch {
+        // No Solana wallet - that's fine
+      }
+
+      // Show current chain selection
+      const currentChain = await resolvePaymentChain();
 
       return {
         text: [
-          "🦞 **ClawRouter Wallet**",
+          "**ClawRouter Wallet**",
           "",
-          `**Address:** \`${address}\``,
-          `**${balanceText}**`,
+          `**Payment Chain:** ${currentChain === "solana" ? "Solana" : "Base (EVM)"}`,
+          "",
+          "**Base (EVM):**",
+          `  Address: \`${address}\``,
+          `  ${evmBalanceText}`,
+          `  Fund: https://basescan.org/address/${address}`,
+          solanaSection,
+          "",
           `**Key File:** \`${WALLET_FILE}\``,
           "",
           "**Commands:**",
           "• `/wallet` - Show this status",
           "• `/wallet export` - Export private key for backup",
-          "",
-          `**Fund with USDC on Base:** https://basescan.org/address/${address}`,
-        ].join("\n"),
+          !solanaSection ? "• `/wallet solana` - Enable Solana payments" : "",
+          solanaSection ? "• `/wallet base` - Switch to Base (EVM)" : "",
+          solanaSection ? "• `/wallet solana` - Switch to Solana" : "",
+          solanaSection ? "• `/wallet migrate-solana` - Sweep funds from old Solana wallet" : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
       };
     },
   };
@@ -624,7 +1034,7 @@ const plugin: OpenClawPluginDefinition = {
   description: "Smart LLM router — 30+ models, x402 micropayments, 78% cost savings",
   version: VERSION,
 
-  async register(api: OpenClawPluginApi) {
+  register(api: OpenClawPluginApi) {
     // Check if ClawRouter is disabled via environment variable
     // Usage: CLAWROUTER_DISABLED=true openclaw gateway start
     const isDisabled =
@@ -672,14 +1082,29 @@ const plugin: OpenClawPluginDefinition = {
 
     // Register partner API tools (Twitter/X lookup, etc.)
     try {
-      const { buildPartnerTools, PARTNER_SERVICES } = await import("./partners/index.js");
       const proxyBaseUrl = `http://127.0.0.1:${runtimePort}`;
       const partnerTools = buildPartnerTools(proxyBaseUrl);
       for (const tool of partnerTools) {
         api.registerTool(tool);
       }
       if (partnerTools.length > 0) {
-        api.logger.info(`Registered ${partnerTools.length} partner tool(s): ${partnerTools.map((t) => t.name).join(", ")}`);
+        api.logger.info(
+          `Registered ${partnerTools.length} partner tool(s): ${partnerTools.map((t) => t.name).join(", ")}`,
+        );
+      }
+
+      // Register local always-on memory tools (if any): query, ingest, status, list, consolidate.
+      const memoryAgentBaseUrl = getMemoryAgentBaseUrl();
+      const memoryTools = buildMemoryAgentTools(memoryAgentBaseUrl);
+      for (const tool of memoryTools) {
+        api.registerTool(tool);
+      }
+      if (memoryTools.length > 0) {
+        api.logger.info(
+          `Registered ${memoryTools.length} memory tool(s): ${memoryTools
+            .map((t) => t.name)
+            .join(", ")} (base ${memoryAgentBaseUrl})`,
+        );
       }
 
       // Register /partners command
@@ -693,21 +1118,106 @@ const plugin: OpenClawPluginDefinition = {
             return { text: "No partner APIs available." };
           }
 
-          const lines = [
-            "**Partner APIs** (paid via your ClawRouter wallet)",
-            "",
-          ];
+          const lines = ["**Partner APIs** (paid via your ClawRouter wallet)", ""];
 
           for (const svc of PARTNER_SERVICES) {
             lines.push(`**${svc.name}** (${svc.partner})`);
             lines.push(`  ${svc.description}`);
             lines.push(`  Tool: \`${`blockrun_${svc.id}`}\``);
-            lines.push(`  Pricing: ${svc.pricing.perUnit} per ${svc.pricing.unit} (min ${svc.pricing.minimum}, max ${svc.pricing.maximum})`);
-            lines.push(`  **How to use:** Ask "Look up Twitter user @elonmusk" or "Get info on these X accounts: @naval, @balajis"`);
+            lines.push(
+              `  Pricing: ${svc.pricing.perUnit} per ${svc.pricing.unit} (min ${svc.pricing.minimum}, max ${svc.pricing.maximum})`,
+            );
+            lines.push(
+              `  **How to use:** Ask "Look up Twitter user @elonmusk" or "Get info on these X accounts: @naval, @balajis"`,
+            );
             lines.push("");
           }
 
           return { text: lines.join("\n") };
+        },
+      });
+
+      // Register /memory-agent command for direct operational checks and ad-hoc actions.
+      api.registerCommand({
+        name: "memory-agent",
+        description: "Inspect or operate the local always-on memory agent",
+        acceptsArgs: true,
+        requireAuth: false,
+        handler: async (ctx: PluginCommandContext) => {
+          const raw = ctx.args?.trim() || "status";
+          const [subCommand, ...rest] = raw.split(/\s+/);
+          const baseUrl = getMemoryAgentBaseUrl();
+          const text = rest.join(" ").trim();
+
+          try {
+            switch ((subCommand || "status").toLowerCase()) {
+              case "help":
+                return {
+                  text: [
+                    "**memory-agent**",
+                    `Service base URL: ${baseUrl}`,
+                    "",
+                    "Commands:",
+                    "• `status` - agent stats",
+                    "• `query <question>` - ask memory",
+                    "• `ingest <text>` - store a memory",
+                    "• `consolidate` - run consolidation",
+                    "• `memories` - list latest memories",
+                    "",
+                    "Set OPENCLAW_MEMORY_AGENT_BASE_URL to change endpoint (default: http://127.0.0.1:8888).",
+                  ].join("\n"),
+                };
+              case "query": {
+                if (!text) {
+                  return { text: "Usage: /memory-agent query <question>", isError: true };
+                }
+                const response = await callMemoryAgent(
+                  baseUrl,
+                  `/query?q=${encodeURIComponent(text)}`,
+                  { method: "GET" },
+                );
+                return {
+                  text: `**Question:** ${text}\n\n\`\`\`json\n${JSON.stringify(response, null, 2)}\n\`\`\``,
+                };
+              }
+              case "ingest": {
+                if (!text) {
+                  return { text: "Usage: /memory-agent ingest <text>", isError: true };
+                }
+                const response = await callMemoryAgent(baseUrl, "/ingest", {
+                  method: "POST",
+                  body: JSON.stringify({ text, source: "openclaw-router-command" }),
+                });
+                return { text: JSON.stringify(response, null, 2) };
+              }
+              case "memories": {
+                const response = await callMemoryAgent(baseUrl, "/memories", { method: "GET" });
+                return { text: JSON.stringify(response, null, 2) };
+              }
+              case "consolidate": {
+                const response = await callMemoryAgent(baseUrl, "/consolidate", {
+                  method: "POST",
+                });
+                return { text: JSON.stringify(response, null, 2) };
+              }
+              case "status":
+              default: {
+                const response = await callMemoryAgent(baseUrl, "/status", { method: "GET" });
+                return {
+                  text: `\`\`\`json\n${JSON.stringify(response, null, 2)}\n\`\`\``,
+                };
+              }
+            }
+          } catch (err) {
+                return {
+                  text: [
+                    `Failed to call memory agent at ${baseUrl}.`,
+                    `Error: ${err instanceof Error ? err.message : String(err)}`,
+                    "Start the service with: `python generative-ai/gemini/agents/always-on-memory-agent/agent.py --watch <inbox> --port 8888`",
+                  ].join("\n"),
+                  isError: true,
+                };
+          }
         },
       });
     } catch (err) {
@@ -816,7 +1326,15 @@ export default plugin;
 
 // Re-export for programmatic use
 export { startProxy, getProxyPort } from "./proxy.js";
-export type { ProxyOptions, ProxyHandle, LowBalanceInfo, InsufficientFundsInfo } from "./proxy.js";
+export type {
+  ProxyOptions,
+  ProxyHandle,
+  WalletConfig,
+  PaymentChain,
+  LowBalanceInfo,
+  InsufficientFundsInfo,
+} from "./proxy.js";
+export type { WalletResolution } from "./auth.js";
 export { blockrunProvider } from "./provider.js";
 export {
   OPENCLAW_MODELS,
@@ -840,12 +1358,37 @@ export { logUsage } from "./logger.js";
 export type { UsageEntry } from "./logger.js";
 export { RequestDeduplicator } from "./dedup.js";
 export type { CachedResponse } from "./dedup.js";
-export { PaymentCache } from "./payment-cache.js";
-export type { CachedPaymentParams } from "./payment-cache.js";
-export { createPaymentFetch } from "./x402.js";
-export type { PreAuthParams, PaymentFetchResult } from "./x402.js";
 export { BalanceMonitor, BALANCE_THRESHOLDS } from "./balance.js";
 export type { BalanceInfo, SufficiencyResult } from "./balance.js";
+export { SolanaBalanceMonitor } from "./solana-balance.js";
+export type { SolanaBalanceInfo } from "./solana-balance.js";
+export {
+  SpendControl,
+  FileSpendControlStorage,
+  InMemorySpendControlStorage,
+  formatDuration,
+} from "./spend-control.js";
+export type {
+  SpendWindow,
+  SpendLimits,
+  SpendRecord,
+  SpendingStatus,
+  CheckResult,
+  SpendControlStorage,
+  SpendControlOptions,
+} from "./spend-control.js";
+export {
+  generateWalletMnemonic,
+  isValidMnemonic,
+  deriveEvmKey,
+  deriveSolanaKeyBytes,
+  deriveSolanaKeyBytesLegacy,
+  deriveAllKeys,
+} from "./wallet.js";
+export type { DerivedKeys } from "./wallet.js";
+export { sweepSolanaWallet } from "./solana-sweep.js";
+export type { SweepResult, SweepError } from "./solana-sweep.js";
+export { setupSolana, savePaymentChain, loadPaymentChain, resolvePaymentChain } from "./auth.js";
 export {
   InsufficientFundsError,
   EmptyWalletError,
@@ -857,9 +1400,14 @@ export {
 } from "./errors.js";
 export { fetchWithRetry, isRetryable, DEFAULT_RETRY_CONFIG } from "./retry.js";
 export type { RetryConfig } from "./retry.js";
-export { getStats, formatStatsAscii } from "./stats.js";
+export { getStats, formatStatsAscii, clearStats } from "./stats.js";
 export type { DailyStats, AggregatedStats } from "./stats.js";
-export { SessionStore, getSessionId, DEFAULT_SESSION_CONFIG } from "./session.js";
+export {
+  SessionStore,
+  getSessionId,
+  hashRequestContent,
+  DEFAULT_SESSION_CONFIG,
+} from "./session.js";
 export type { SessionEntry, SessionConfig } from "./session.js";
 export { ResponseCache } from "./response-cache.js";
 export type { CachedLLMResponse, ResponseCacheConfig } from "./response-cache.js";

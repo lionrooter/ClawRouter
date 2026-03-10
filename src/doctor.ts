@@ -5,13 +5,17 @@
  * Works independently of OpenClaw - direct x402 payment to BlockRun API.
  */
 
-import { homedir, platform, arch, freemem, totalmem } from "node:os";
-import { join } from "node:path";
-import { stat, readdir } from "node:fs/promises";
+import { platform, arch, freemem, totalmem } from "node:os";
+import { createPublicClient, http } from "viem";
+import { base } from "viem/chains";
+import { privateKeyToAccount } from "viem/accounts";
+import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
+import { registerExactEvmScheme } from "@x402/evm/exact/client";
+import { toClientEvmSigner } from "@x402/evm";
 import { resolveOrGenerateWalletKey, WALLET_FILE } from "./auth.js";
 import { BalanceMonitor } from "./balance.js";
+import { getSolanaAddress } from "./wallet.js";
 import { getStats } from "./stats.js";
-import { createPaymentFetch } from "./x402.js";
 import { getProxyPort } from "./proxy.js";
 import { VERSION } from "./version.js";
 
@@ -28,6 +32,7 @@ interface WalletInfo {
   exists: boolean;
   valid: boolean;
   address: string | null;
+  solanaAddress: string | null;
   balance: string | null;
   isLow: boolean;
   isEmpty: boolean;
@@ -87,18 +92,29 @@ function collectSystemInfo(): SystemInfo {
 // Collect wallet info
 async function collectWalletInfo(): Promise<WalletInfo> {
   try {
-    const { key, address, source } = await resolveOrGenerateWalletKey();
+    const { key, address, source, solanaPrivateKeyBytes } = await resolveOrGenerateWalletKey();
 
     if (!key || !address) {
       return {
         exists: false,
         valid: false,
         address: null,
+        solanaAddress: null,
         balance: null,
         isLow: false,
         isEmpty: true,
         source: null,
       };
+    }
+
+    // Derive Solana address if mnemonic-based wallet
+    let solanaAddress: string | null = null;
+    if (solanaPrivateKeyBytes) {
+      try {
+        solanaAddress = await getSolanaAddress(solanaPrivateKeyBytes);
+      } catch {
+        // Non-fatal
+      }
     }
 
     // Check balance
@@ -109,6 +125,7 @@ async function collectWalletInfo(): Promise<WalletInfo> {
         exists: true,
         valid: true,
         address,
+        solanaAddress,
         balance: balanceInfo.balanceUSD,
         isLow: balanceInfo.isLow,
         isEmpty: balanceInfo.isEmpty,
@@ -119,6 +136,7 @@ async function collectWalletInfo(): Promise<WalletInfo> {
         exists: true,
         valid: true,
         address,
+        solanaAddress,
         balance: null,
         isLow: false,
         isEmpty: false,
@@ -130,6 +148,7 @@ async function collectWalletInfo(): Promise<WalletInfo> {
       exists: false,
       valid: false,
       address: null,
+      solanaAddress: null,
       balance: null,
       isLow: false,
       isEmpty: true,
@@ -154,7 +173,7 @@ async function collectNetworkInfo(): Promise<NetworkInfo> {
     blockrunLatency = Date.now() - start;
     blockrunReachable = response.ok || response.status === 402;
   } catch {
-    blockrunReachable = false;
+    // blockrunReachable already false
   }
 
   // Check local proxy
@@ -166,7 +185,7 @@ async function collectNetworkInfo(): Promise<NetworkInfo> {
     });
     proxyRunning = response.ok;
   } catch {
-    proxyRunning = false;
+    // proxyRunning already false
   }
 
   return {
@@ -231,7 +250,10 @@ function printDiagnostics(result: DiagnosticResult): void {
   console.log("\nWallet");
   if (result.wallet.exists && result.wallet.valid) {
     console.log(`  ${green(`Key: ${WALLET_FILE} (${result.wallet.source})`)}`);
-    console.log(`  ${green(`Address: ${result.wallet.address}`)}`);
+    console.log(`  ${green(`EVM Address:    ${result.wallet.address}`)}`);
+    if (result.wallet.solanaAddress) {
+      console.log(`  ${green(`Solana Address: ${result.wallet.solanaAddress}`)}`);
+    }
     if (result.wallet.isEmpty) {
       console.log(`  ${red(`Balance: $0.00 - NEED TO FUND!`)}`);
     } else if (result.wallet.isLow) {
@@ -303,7 +325,10 @@ async function analyzeWithAI(
   // Check if wallet has funds
   if (diagnostics.wallet.isEmpty) {
     console.log("\n💳 Wallet is empty - cannot call AI for analysis.");
-    console.log(`   Fund your wallet with USDC on Base: ${diagnostics.wallet.address}`);
+    console.log(`   Fund your EVM wallet with USDC on Base: ${diagnostics.wallet.address}`);
+    if (diagnostics.wallet.solanaAddress) {
+      console.log(`   Fund your Solana wallet with USDC: ${diagnostics.wallet.solanaAddress}`);
+    }
     console.log("   Get USDC: https://www.coinbase.com/price/usd-coin");
     console.log("   Bridge to Base: https://bridge.base.org\n");
     return;
@@ -314,39 +339,40 @@ async function analyzeWithAI(
 
   try {
     const { key } = await resolveOrGenerateWalletKey();
-    const { fetch: paymentFetch } = createPaymentFetch(key as `0x${string}`);
+    const account = privateKeyToAccount(key as `0x${string}`);
+    const publicClient = createPublicClient({ chain: base, transport: http() });
+    const evmSigner = toClientEvmSigner(account, publicClient);
+    const x402 = new x402Client();
+    registerExactEvmScheme(x402, { signer: evmSigner });
+    const paymentFetch = wrapFetchWithPayment(fetch, x402);
 
-    const response = await paymentFetch(
-      "https://blockrun.ai/api/v1/chat/completions",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: modelConfig.id,
-          stream: false,
-          messages: [
-            {
-              role: "system",
-              content: `You are a technical support expert for BlockRun and ClawRouter.
+    const response = await paymentFetch("https://blockrun.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: modelConfig.id,
+        stream: false,
+        messages: [
+          {
+            role: "system",
+            content: `You are a technical support expert for BlockRun and ClawRouter.
 Analyze the diagnostics and:
 1. Identify the root cause of any issues
 2. Provide specific, actionable fix commands (bash)
 3. Explain why the issue occurred briefly
 4. Be concise but thorough
 5. Format commands in code blocks`,
-            },
-            {
-              role: "user",
-              content: userQuestion
-                ? `Here are my system diagnostics:\n\n${JSON.stringify(diagnostics, null, 2)}\n\nUser's question: ${userQuestion}`
-                : `Here are my system diagnostics:\n\n${JSON.stringify(diagnostics, null, 2)}\n\nPlease analyze and help me fix any issues.`,
-            },
-          ],
-          max_tokens: 1000,
-        }),
-      },
-      undefined,
-    );
+          },
+          {
+            role: "user",
+            content: userQuestion
+              ? `Here are my system diagnostics:\n\n${JSON.stringify(diagnostics, null, 2)}\n\nUser's question: ${userQuestion}`
+              : `Here are my system diagnostics:\n\n${JSON.stringify(diagnostics, null, 2)}\n\nPlease analyze and help me fix any issues.`,
+          },
+        ],
+        max_tokens: 1000,
+      }),
+    });
 
     if (!response.ok) {
       const text = await response.text();

@@ -15,8 +15,6 @@
  *     before the x402 flow, preventing OpenClaw's 10-15s timeout from firing.
  *   - Response dedup: hashes request bodies and caches responses for 30s,
  *     preventing double-charging when OpenClaw retries after timeout.
- *   - Payment cache: after first 402, pre-signs subsequent requests to skip
- *     the 402 round trip (~200ms savings per request).
  *   - Smart routing: when model is "blockrun/auto", classify query and pick cheapest model.
  *   - Usage logging: log every request as JSON line to ~/.openclaw/blockrun/logs/
  */
@@ -24,42 +22,66 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { finished } from "node:stream";
 import type { AddressInfo } from "node:net";
+import { createPublicClient, http } from "viem";
+import { base } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
-import { createPaymentFetch, type PreAuthParams } from "./x402.js";
+import { x402Client } from "@x402/fetch";
+import { createPayFetchWithPreAuth } from "./payment-preauth.js";
+import { registerExactEvmScheme } from "@x402/evm/exact/client";
+import { toClientEvmSigner } from "@x402/evm";
 import {
   route,
   getFallbackChain,
   getFallbackChainFiltered,
+  filterByToolCalling,
+  filterByVision,
   calculateModelCost,
   DEFAULT_ROUTING_CONFIG,
   type RouterOptions,
   type RoutingDecision,
   type RoutingConfig,
   type ModelPricing,
+  type Tier,
 } from "./router/index.js";
+import { classifyByRules } from "./router/rules.js";
 import {
   BLOCKRUN_MODELS,
   OPENCLAW_MODELS,
   resolveModelAlias,
   getModelContextWindow,
   isReasoningModel,
+  supportsToolCalling,
+  supportsVision,
 } from "./models.js";
 import { logUsage, type UsageEntry } from "./logger.js";
-import { getStats } from "./stats.js";
+import { getStats, clearStats } from "./stats.js";
 import { RequestDeduplicator } from "./dedup.js";
 import { ResponseCache, type ResponseCacheConfig } from "./response-cache.js";
 import { BalanceMonitor } from "./balance.js";
+import { SolanaBalanceMonitor } from "./solana-balance.js";
+
+/** Union type for chain-agnostic balance monitoring */
+type AnyBalanceMonitor = BalanceMonitor | SolanaBalanceMonitor;
+import { resolvePaymentChain } from "./auth.js";
 import { compressContext, shouldCompress, type NormalizedMessage } from "./compression/index.js";
 // Error classes available for programmatic use but not used in proxy
 // (universal free fallback means we don't throw balance errors anymore)
 // import { InsufficientFundsError, EmptyWalletError } from "./errors.js";
 import { USER_AGENT } from "./version.js";
-import { SessionStore, getSessionId, type SessionConfig } from "./session.js";
+import {
+  SessionStore,
+  getSessionId,
+  deriveSessionId,
+  hashRequestContent,
+  type SessionConfig,
+} from "./session.js";
 import { checkForUpdates } from "./updater.js";
 import { PROXY_PORT } from "./config.js";
 import { SessionJournal } from "./journal.js";
 
 const BLOCKRUN_API = "https://blockrun.ai/api";
+const BLOCKRUN_SOLANA_API = "https://sol.blockrun.ai/api";
+const LOCAL_CLI_PROXY_API = "http://127.0.0.1:11435";
 // Routing profile models - virtual models that trigger intelligent routing
 const AUTO_MODEL = "blockrun/auto";
 
@@ -145,11 +167,30 @@ function transformPaymentError(errorBody: string): string {
             },
           });
         }
+
+        // Handle transaction simulation failures (Solana on-chain validation)
+        if (innerJson.invalidReason === "transaction_simulation_failed") {
+          console.error(
+            `[ClawRouter] Solana transaction simulation failed: ${innerJson.invalidMessage || "unknown"}`,
+          );
+          return JSON.stringify({
+            error: {
+              message: "Solana payment simulation failed. Retrying with a different model.",
+              type: "transaction_simulation_failed",
+              help: "This is usually temporary. If it persists, check your Solana USDC balance or try: /model free",
+            },
+          });
+        }
       }
     }
 
     // Handle settlement failures (gas estimation, on-chain errors)
-    if (parsed.error === "Settlement failed" || parsed.details?.includes("Settlement failed")) {
+    if (
+      parsed.error === "Settlement failed" ||
+      parsed.error === "Payment settlement failed" ||
+      parsed.details?.includes("Settlement failed") ||
+      parsed.details?.includes("transaction_simulation_failed")
+    ) {
       const details = parsed.details || "";
       const gasError = details.includes("unable to estimate gas");
 
@@ -259,7 +300,9 @@ export function getProxyPort(): number {
  * Check if a proxy is already running on the given port.
  * Returns the wallet address if running, undefined otherwise.
  */
-async function checkExistingProxy(port: number): Promise<string | undefined> {
+async function checkExistingProxy(
+  port: number,
+): Promise<{ wallet: string; paymentChain?: string } | undefined> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
 
@@ -270,9 +313,13 @@ async function checkExistingProxy(port: number): Promise<string | undefined> {
     clearTimeout(timeoutId);
 
     if (response.ok) {
-      const data = (await response.json()) as { status?: string; wallet?: string };
+      const data = (await response.json()) as {
+        status?: string;
+        wallet?: string;
+        paymentChain?: string;
+      };
       if (data.status === "ok" && data.wallet) {
-        return data.wallet;
+        return { wallet: data.wallet, paymentChain: data.paymentChain };
       }
     }
     return undefined;
@@ -292,6 +339,9 @@ const PROVIDER_ERROR_PATTERNS = [
   /credits/i,
   /quota.*exceeded/i,
   /rate.*limit/i,
+  /you\s*have\s*hit\s*your\s*limit/i,
+  /you['’]ve\s*hit\s*your\s*limit/i,
+  /rate\s*limited/i,
   /model.*unavailable/i,
   /model.*not.*available/i,
   /service.*unavailable/i,
@@ -300,12 +350,28 @@ const PROVIDER_ERROR_PATTERNS = [
   /temporarily.*unavailable/i,
   /api.*key.*invalid/i,
   /authentication.*failed/i,
+  /oauth/i,
+  /auth.*failed/i,
   /request too large/i,
   /request.*size.*exceeds/i,
   /payload too large/i,
   /payment.*verification.*failed/i,
   /model.*not.*allowed/i,
-  /unknown.*model/i,
+  /too many requests/i,
+];
+
+/**
+ * Patterns that indicate client request bugs and should stop fallback.
+ */
+const CLIENT_BUG_PATTERNS = [
+  /messages\s+must\s+be/i,
+  /invalid\s+request/i,
+  /unknown\s+parameter/i,
+  /failed\s+to\s+parse/i,
+  /invalid\s+json/i,
+  /model\s+not\s+found/i,
+  /unknown\s+model/i,
+  /invalid\s+model/i,
 ];
 
 /**
@@ -316,6 +382,9 @@ const DEGRADED_RESPONSE_PATTERNS = [
   /the ai service is temporarily overloaded/i,
   /service is temporarily overloaded/i,
   /please try again in a moment/i,
+  /you\s*have\s*hit\s*your\s*limit/i,
+  /you['’]ve\s*hit\s*your\s*limit/i,
+  /you\s*have\s*been\s*rate\s*limited/i,
 ];
 
 /**
@@ -327,6 +396,271 @@ const DEGRADED_LOOP_PATTERNS = [
   /the final answer is the boxed\./i,
 ];
 
+const RATE_LIMIT_PATTERNS = [
+  /rate\s*limit/i,
+  /too\s*many\s*requests/i,
+  /you\s*have\s*hit\s*your\s*limit/i,
+  /you['’]ve\s*hit\s*your\s*limit/i,
+  /hit\s*your\s*limit/i,
+];
+const BILLING_PATTERNS = [/billing/i, /credits/i, /insufficient.*balance/i, /quota/i, /payment/i];
+const AUTH_PATTERNS = [/invalid\s+api\s+key/i, /oauth/i, /auth/i, /unauthorized/i, /forbidden/i, /expired/i];
+const OUTAGE_PATTERNS = [/service\s+unavailable/i, /temporarily\s+unavailable/i, /overloaded/i, /capacity/i];
+
+type UpstreamError = {
+  message: string;
+  type?: string;
+};
+
+type ProviderFailureClassification = {
+  isProviderError: boolean;
+  isClientBug: boolean;
+  isRateLimited: boolean;
+  reason: string;
+  error?: UpstreamError;
+};
+
+function anyPatternMatch(message: string, patterns: RegExp[]): boolean {
+  return patterns.some((pattern) => pattern.test(message));
+}
+
+export function usesLocalCliProxy(modelId: string): boolean {
+  const normalized = String(modelId || "").trim().toLowerCase();
+  return (
+    normalized === "local" ||
+    normalized.startsWith("local/") ||
+    normalized === "exo" ||
+    normalized.startsWith("exo/") ||
+    normalized === "tool-local" ||
+    normalized.startsWith("tool-local/") ||
+    normalized.startsWith("ollama/") ||
+    normalized === "codex" ||
+    normalized.startsWith("codex/") ||
+    normalized.startsWith("claude-cli/")
+  );
+}
+
+export function resolveModelDispatchUrl(upstreamUrl: string, modelId: string): string {
+  if (!usesLocalCliProxy(modelId)) {
+    return upstreamUrl;
+  }
+  return new URL("/v1/chat/completions", LOCAL_CLI_PROXY_API).toString();
+}
+
+function looksLikeSse(body: string): boolean {
+  return /(^|\n)\s*data:\s*/m.test(body);
+}
+
+function parseSsePayloads(body: string): unknown[] {
+  const events: unknown[] = [];
+  const normalized = body.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+
+  for (const line of lines) {
+    const match = line.match(/^\s*data:\s*(.*)$/);
+    if (!match) continue;
+
+    const data = match[1]?.trim();
+    if (!data || data === "[DONE]") continue;
+
+    try {
+      events.push(JSON.parse(data));
+    } catch {
+      // Ignore non-JSON SSE payloads
+    }
+  }
+
+  return events;
+}
+
+function extractUpstreamErrorFromPayload(payload: unknown): UpstreamError | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+
+  const obj = payload as Record<string, unknown>;
+
+  // Standard OpenAI-style { error: { message, type } }
+  const errorValue = obj.error;
+  if (typeof errorValue === "string") {
+    return { message: errorValue };
+  }
+  if (errorValue && typeof errorValue === "object") {
+    const errorObj = errorValue as Record<string, unknown>;
+    if (typeof errorObj.message === "string") {
+      return {
+        message: errorObj.message,
+        type: typeof errorObj.type === "string" ? errorObj.type : undefined,
+      };
+    }
+  }
+
+  // CLI-style { is_error: true, result: "..." }
+  if (
+    obj.is_error === true &&
+    typeof obj.result === "string" &&
+    obj.result.trim().length > 0
+  ) {
+    return {
+      message: obj.result,
+      type: "proxy_error",
+    };
+  }
+
+  // Alternative error envelope: { type: "error", message: "..." }
+  if (obj.type === "error" && typeof obj.message === "string") {
+    return { message: obj.message, type: "proxy_error" };
+  }
+
+  return undefined;
+}
+
+function extractUpstreamError(body: string): UpstreamError | undefined {
+  if (!body) return undefined;
+
+  if (looksLikeSse(body)) {
+    for (const event of parseSsePayloads(body)) {
+      const error = extractUpstreamErrorFromPayload(event);
+      if (error) return error;
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    return extractUpstreamErrorFromPayload(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
+function classifyProviderFailure(params: {
+  status: number;
+  body: string;
+  contentType?: string | null;
+}): ProviderFailureClassification {
+  const { status, body } = params;
+
+  const normalizedBody = body || "";
+  const upstreamError = extractUpstreamError(normalizedBody);
+  if (upstreamError?.message) {
+    const message = upstreamError.message;
+    const isClientBug = anyPatternMatch(message, CLIENT_BUG_PATTERNS);
+
+    if (status === 200) {
+      return {
+        isProviderError: !isClientBug,
+        isClientBug,
+        isRateLimited: anyPatternMatch(message, RATE_LIMIT_PATTERNS),
+        reason: isClientBug ? "embedded_client_error" : "embedded_provider_error",
+        error: upstreamError,
+      };
+    }
+
+    if (status === 400) {
+      const isProvider =
+        !isClientBug &&
+        (anyPatternMatch(message, PROVIDER_ERROR_PATTERNS) ||
+          anyPatternMatch(message, RATE_LIMIT_PATTERNS) ||
+          anyPatternMatch(message, BILLING_PATTERNS) ||
+          anyPatternMatch(message, AUTH_PATTERNS) ||
+          anyPatternMatch(message, OUTAGE_PATTERNS));
+
+      return {
+        isProviderError: isProvider,
+        isClientBug,
+        isRateLimited: anyPatternMatch(message, RATE_LIMIT_PATTERNS),
+        reason: isProvider ? "400_embedded_provider_error" : "400_embedded_client_error",
+        error: upstreamError,
+      };
+    }
+  }
+
+  // 200 responses can carry provider failures in success envelopes.
+  if (status === 200) {
+    const degraded = detectDegradedSuccessResponse(normalizedBody);
+    if (degraded) {
+      return {
+        isProviderError: true,
+        isClientBug: false,
+        isRateLimited: anyPatternMatch(normalizedBody, RATE_LIMIT_PATTERNS),
+        reason: degraded,
+      };
+    }
+
+    return {
+      isProviderError: false,
+      isClientBug: false,
+      isRateLimited: false,
+      reason: "200_success",
+    };
+  }
+
+  // Non-200 provider status handling
+  if (!FALLBACK_STATUS_CODES.includes(status)) {
+    return {
+      isProviderError: false,
+      isClientBug: false,
+      isRateLimited: false,
+      reason: `status_${status}_non_fallback`,
+    };
+  }
+
+  if (status === 429) {
+    return {
+      isProviderError: true,
+      isClientBug: false,
+      isRateLimited: true,
+      reason: "status_429",
+      error: upstreamError,
+    };
+  }
+
+  if (status === 401 || status === 403 || status === 402) {
+    return {
+      isProviderError: true,
+      isClientBug: false,
+      isRateLimited: false,
+      reason: `status_${status}`,
+      error: upstreamError,
+    };
+  }
+
+  if (status >= 500) {
+    return {
+      isProviderError: true,
+      isClientBug: false,
+      isRateLimited: false,
+      reason: `status_${status}`,
+      error: upstreamError,
+    };
+  }
+
+  // 400 is ambiguous; only fallback when strongly provider-like.
+  if (status === 400) {
+    const providerLike =
+      anyPatternMatch(normalizedBody, PROVIDER_ERROR_PATTERNS) ||
+      anyPatternMatch(normalizedBody, RATE_LIMIT_PATTERNS) ||
+      anyPatternMatch(normalizedBody, BILLING_PATTERNS) ||
+      anyPatternMatch(normalizedBody, AUTH_PATTERNS) ||
+      anyPatternMatch(normalizedBody, OUTAGE_PATTERNS);
+    return {
+      isProviderError: providerLike,
+      isClientBug: !providerLike,
+      isRateLimited: anyPatternMatch(normalizedBody, RATE_LIMIT_PATTERNS),
+      reason: providerLike ? "400_provider_like" : "400_client_like",
+      error: upstreamError,
+    };
+  }
+
+  // Other mapped fallback statuses (413 etc.)
+  const providerLike = anyPatternMatch(normalizedBody, PROVIDER_ERROR_PATTERNS);
+  return {
+    isProviderError: providerLike,
+    isClientBug: false,
+    isRateLimited: false,
+    reason: `status_${status}`,
+    error: upstreamError,
+  };
+}
+
 function extractAssistantContent(payload: unknown): string | undefined {
   if (!payload || typeof payload !== "object") return undefined;
   const record = payload as Record<string, unknown>;
@@ -336,10 +670,27 @@ function extractAssistantContent(payload: unknown): string | undefined {
   const firstChoice = choices[0];
   if (!firstChoice || typeof firstChoice !== "object") return undefined;
   const choice = firstChoice as Record<string, unknown>;
+
   const message = choice.message;
-  if (!message || typeof message !== "object") return undefined;
-  const content = (message as Record<string, unknown>).content;
-  return typeof content === "string" ? content : undefined;
+  if (message && typeof message === "object") {
+    const content = (message as Record<string, unknown>).content;
+    if (typeof content === "string") return content;
+  }
+
+  const delta = choice.delta;
+  if (delta && typeof delta === "object") {
+    const content = (delta as Record<string, unknown>).content;
+    if (typeof content === "string") return content;
+  }
+
+  return undefined;
+}
+
+function isDegradedResponseText(text: string): boolean {
+  return (
+    DEGRADED_RESPONSE_PATTERNS.some((pattern) => pattern.test(text)) ||
+    PROVIDER_ERROR_PATTERNS.some((pattern) => pattern.test(text))
+  );
 }
 
 function hasKnownLoopSignature(text: string): boolean {
@@ -374,9 +725,45 @@ export function detectDegradedSuccessResponse(body: string): string | undefined 
   const trimmed = body.trim();
   if (!trimmed) return undefined;
 
+  if (looksLikeSse(trimmed)) {
+    const parsedEvents = parseSsePayloads(trimmed);
+    const assistantChunks: string[] = [];
+
+    for (const event of parsedEvents) {
+      const eventError = extractUpstreamErrorFromPayload(event);
+      if (eventError?.message &&
+        (PROVIDER_ERROR_PATTERNS.some((pattern) => pattern.test(eventError.message)) ||
+          DEGRADED_RESPONSE_PATTERNS.some((pattern) => pattern.test(eventError.message)))
+      ) {
+        return `degraded response: ${eventError.message.slice(0, 120)}`;
+      }
+
+      const assistantContent = extractAssistantContent(event);
+      if (assistantContent) {
+        assistantChunks.push(assistantContent);
+      }
+    }
+
+    const assistantText = assistantChunks.join("");
+    if (assistantText) {
+      if (isDegradedResponseText(assistantText)) {
+        return "degraded response: degraded assistant content";
+      }
+      if (hasKnownLoopSignature(assistantText)) {
+        return "degraded response: repetitive assistant loop";
+      }
+    }
+
+    // Continue with fallback checks below for non-stream patterns.
+  }
+
   // Plain-text placeholder response.
   if (DEGRADED_RESPONSE_PATTERNS.some((pattern) => pattern.test(trimmed))) {
     return "degraded response: overloaded placeholder";
+  }
+
+  if (PROVIDER_ERROR_PATTERNS.some((pattern) => pattern.test(trimmed))) {
+    return "degraded response: provider error pattern";
   }
 
   // Plain-text looping garbage response.
@@ -388,29 +775,19 @@ export function detectDegradedSuccessResponse(body: string): string | undefined 
     const parsed = JSON.parse(trimmed) as Record<string, unknown>;
 
     // Some providers return JSON error payloads with HTTP 200.
-    const errorField = parsed.error;
-    let errorText = "";
-    if (typeof errorField === "string") {
-      errorText = errorField;
-    } else if (errorField && typeof errorField === "object") {
-      const errObj = errorField as Record<string, unknown>;
-      errorText = [
-        typeof errObj.message === "string" ? errObj.message : "",
-        typeof errObj.type === "string" ? errObj.type : "",
-        typeof errObj.code === "string" ? errObj.code : "",
-      ]
-        .filter(Boolean)
-        .join(" ");
-    }
-    if (errorText && PROVIDER_ERROR_PATTERNS.some((pattern) => pattern.test(errorText))) {
-      return `degraded response: ${errorText.slice(0, 120)}`;
+    const parsedError = extractUpstreamErrorFromPayload(parsed);
+    if (parsedError?.message) {
+      const { message } = parsedError;
+      if (DEGRADED_RESPONSE_PATTERNS.some((pattern) => pattern.test(message))) {
+        return `degraded response: ${message.slice(0, 120)}`;
+      }
     }
 
     // Successful wrapper with bad assistant content.
     const assistantContent = extractAssistantContent(parsed);
     if (!assistantContent) return undefined;
-    if (DEGRADED_RESPONSE_PATTERNS.some((pattern) => pattern.test(assistantContent))) {
-      return "degraded response: overloaded assistant content";
+    if (isDegradedResponseText(assistantContent)) {
+      return "degraded response: degraded assistant content";
     }
     if (hasKnownLoopSignature(assistantContent)) {
       return "degraded response: repetitive assistant loop";
@@ -437,24 +814,6 @@ const FALLBACK_STATUS_CODES = [
   503, // Service unavailable
   504, // Gateway timeout
 ];
-
-/**
- * Check if an error response indicates a provider issue that should trigger fallback.
- */
-function isProviderError(status: number, body: string): boolean {
-  // Check status code first
-  if (!FALLBACK_STATUS_CODES.includes(status)) {
-    return false;
-  }
-
-  // For 5xx errors, always fallback
-  if (status >= 500) {
-    return true;
-  }
-
-  // For 4xx errors, check the body for known provider error patterns
-  return PROVIDER_ERROR_PATTERNS.some((pattern) => pattern.test(body));
-}
 
 /**
  * Valid message roles for OpenAI-compatible APIs.
@@ -811,9 +1170,21 @@ export type InsufficientFundsInfo = {
   walletAddress: string;
 };
 
+/**
+ * Wallet config: either a plain EVM private key string, or the full
+ * resolution object from resolveOrGenerateWalletKey() which may include
+ * Solana keys. Using the full object prevents callers from accidentally
+ * forgetting to forward Solana key bytes.
+ */
+export type WalletConfig = string | { key: string; solanaPrivateKeyBytes?: Uint8Array };
+
+export type PaymentChain = "base" | "solana";
+
 export type ProxyOptions = {
-  walletKey: string;
+  wallet: WalletConfig;
   apiBase?: string;
+  /** Payment chain: "base" (default) or "solana". Can also be set via CLAWROUTER_PAYMENT_CHAIN env var. */
+  paymentChain?: PaymentChain;
   /** Port to listen on (default: 8402) */
   port?: number;
   routingConfig?: Partial<RoutingConfig>;
@@ -859,7 +1230,8 @@ export type ProxyHandle = {
   port: number;
   baseUrl: string;
   walletAddress: string;
-  balanceMonitor: BalanceMonitor;
+  solanaAddress?: string;
+  balanceMonitor: AnyBalanceMonitor;
   close: () => Promise<void>;
 };
 
@@ -954,11 +1326,7 @@ async function proxyPartnerRequest(
   req: IncomingMessage,
   res: ServerResponse,
   apiBase: string,
-  payFetch: (
-    input: RequestInfo | URL,
-    init?: RequestInit,
-    preAuth?: PreAuthParams,
-  ) => Promise<Response>,
+  payFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
 ): Promise<void> {
   const startTime = Date.now();
   const upstreamUrl = `${apiBase}${req.url}`;
@@ -973,7 +1341,12 @@ async function proxyPartnerRequest(
   // Forward headers (strip hop-by-hop)
   const headers: Record<string, string> = {};
   for (const [key, value] of Object.entries(req.headers)) {
-    if (key === "host" || key === "connection" || key === "transfer-encoding" || key === "content-length")
+    if (
+      key === "host" ||
+      key === "connection" ||
+      key === "transfer-encoding" ||
+      key === "content-length"
+    )
       continue;
     if (typeof value === "string") headers[key] = value;
   }
@@ -1025,9 +1398,41 @@ async function proxyPartnerRequest(
     baselineCost: 0,
     savings: 0,
     latencyMs,
-    partnerId: (req.url?.split("?")[0] ?? "").replace(/^\/v1\//, "").replace(/\//g, "_") || "unknown",
+    partnerId:
+      (req.url?.split("?")[0] ?? "").replace(/^\/v1\//, "").replace(/\//g, "_") || "unknown",
     service: "partner",
   }).catch(() => {});
+}
+
+/**
+ * Upload a base64 data URI to catbox.moe and return a public URL.
+ * Google image models (nano-banana) return data URIs instead of hosted URLs,
+ * which breaks Telegram and other clients that can't render raw base64.
+ */
+async function uploadDataUriToHost(dataUri: string): Promise<string> {
+  const match = dataUri.match(/^data:(image\/\w+);base64,(.+)$/);
+  if (!match) throw new Error("Invalid data URI format");
+  const [, mimeType, b64Data] = match;
+  const ext = mimeType === "image/jpeg" ? "jpg" : (mimeType.split("/")[1] ?? "png");
+
+  const buffer = Buffer.from(b64Data, "base64");
+  const blob = new Blob([buffer], { type: mimeType });
+
+  const form = new FormData();
+  form.append("reqtype", "fileupload");
+  form.append("fileToUpload", blob, `image.${ext}`);
+
+  const resp = await fetch("https://catbox.moe/user/api.php", {
+    method: "POST",
+    body: form,
+  });
+
+  if (!resp.ok) throw new Error(`catbox.moe upload failed: HTTP ${resp.status}`);
+  const result = await resp.text();
+  if (result.startsWith("https://")) {
+    return result.trim();
+  }
+  throw new Error(`catbox.moe upload failed: ${result}`);
 }
 
 /**
@@ -1039,32 +1444,82 @@ async function proxyPartnerRequest(
  * Returns a handle with the assigned port, base URL, and a close function.
  */
 export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
-  const apiBase = options.apiBase ?? BLOCKRUN_API;
+  // Normalize wallet config: string = EVM-only, object = full resolution
+  const walletKey = typeof options.wallet === "string" ? options.wallet : options.wallet.key;
+  const solanaPrivateKeyBytes =
+    typeof options.wallet === "string" ? undefined : options.wallet.solanaPrivateKeyBytes;
+
+  // Payment chain: options > env var > persisted file > default "base".
+  // No dynamic switching — user selects chain via /wallet solana or /wallet base.
+  const paymentChain = options.paymentChain ?? (await resolvePaymentChain());
+  const apiBase =
+    options.apiBase ??
+    (paymentChain === "solana" && solanaPrivateKeyBytes ? BLOCKRUN_SOLANA_API : BLOCKRUN_API);
+  if (paymentChain === "solana" && !solanaPrivateKeyBytes) {
+    console.warn(
+      `[ClawRouter] Payment chain is Solana but no Solana keys provided. Using Base (EVM).`,
+    );
+  } else if (paymentChain === "solana") {
+    console.log(`[ClawRouter] Payment chain: Solana (${BLOCKRUN_SOLANA_API})`);
+  }
 
   // Determine port: options.port > env var > default
   const listenPort = options.port ?? getProxyPort();
 
   // Check if a proxy is already running on this port
-  const existingWallet = await checkExistingProxy(listenPort);
-  if (existingWallet) {
+  const existingProxy = await checkExistingProxy(listenPort);
+  if (existingProxy) {
     // Proxy already running — reuse it instead of failing with EADDRINUSE
-    const account = privateKeyToAccount(options.walletKey as `0x${string}`);
-    const balanceMonitor = new BalanceMonitor(account.address);
+    const account = privateKeyToAccount(walletKey as `0x${string}`);
     const baseUrl = `http://127.0.0.1:${listenPort}`;
 
     // Verify the existing proxy is using the same wallet (or warn if different)
-    if (existingWallet !== account.address) {
+    if (existingProxy.wallet !== account.address) {
       console.warn(
-        `[ClawRouter] Existing proxy on port ${listenPort} uses wallet ${existingWallet}, but current config uses ${account.address}. Reusing existing proxy.`,
+        `[ClawRouter] Existing proxy on port ${listenPort} uses wallet ${existingProxy.wallet}, but current config uses ${account.address}. Reusing existing proxy.`,
       );
     }
+
+    // Verify the existing proxy is using the same payment chain
+    if (existingProxy.paymentChain) {
+      if (existingProxy.paymentChain !== paymentChain) {
+        throw new Error(
+          `Existing proxy on port ${listenPort} is using ${existingProxy.paymentChain} but ${paymentChain} was requested. ` +
+            `Stop the existing proxy first or use a different port.`,
+        );
+      }
+    } else if (paymentChain !== "base") {
+      // Old proxy doesn't report chain — assume Base. Reject if Solana was requested.
+      console.warn(
+        `[ClawRouter] Existing proxy on port ${listenPort} does not report paymentChain (pre-v0.11 instance). Assuming Base.`,
+      );
+      throw new Error(
+        `Existing proxy on port ${listenPort} is a pre-v0.11 instance (assumed Base) but ${paymentChain} was requested. ` +
+          `Stop the existing proxy first or use a different port.`,
+      );
+    }
+
+    // Derive Solana address if keys are available (for wallet status display)
+    let reuseSolanaAddress: string | undefined;
+    if (solanaPrivateKeyBytes) {
+      const { createKeyPairSignerFromPrivateKeyBytes } = await import("@solana/kit");
+      const solanaSigner = await createKeyPairSignerFromPrivateKeyBytes(solanaPrivateKeyBytes);
+      reuseSolanaAddress = solanaSigner.address;
+    }
+
+    // Use chain-appropriate balance monitor
+    const balanceMonitor: AnyBalanceMonitor =
+      paymentChain === "solana" && reuseSolanaAddress
+        ? new SolanaBalanceMonitor(reuseSolanaAddress)
+        : new BalanceMonitor(account.address);
 
     options.onReady?.(listenPort);
 
     return {
       port: listenPort,
       baseUrl,
-      walletAddress: existingWallet,
+      walletAddress: existingProxy.wallet,
+      solanaAddress: reuseSolanaAddress,
       balanceMonitor,
       close: async () => {
         // No-op: we didn't start this proxy, so we shouldn't close it
@@ -1072,12 +1527,47 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
     };
   }
 
-  // Create x402 payment-enabled fetch from wallet private key
-  const account = privateKeyToAccount(options.walletKey as `0x${string}`);
-  const { fetch: payFetch } = createPaymentFetch(options.walletKey as `0x${string}`);
+  // Create x402 payment client with EVM scheme (always available)
+  const account = privateKeyToAccount(walletKey as `0x${string}`);
+  const evmPublicClient = createPublicClient({ chain: base, transport: http() });
+  const evmSigner = toClientEvmSigner(account, evmPublicClient);
+  const x402 = new x402Client();
+  registerExactEvmScheme(x402, { signer: evmSigner });
 
-  // Create balance monitor for pre-request checks
-  const balanceMonitor = new BalanceMonitor(account.address);
+  // Register Solana scheme if key is available
+  // Uses registerExactSvmScheme helper which registers:
+  //   - solana:* wildcard (catches any CAIP-2 Solana network)
+  //   - V1 compat names: "solana", "solana-devnet", "solana-testnet"
+  let solanaAddress: string | undefined;
+  if (solanaPrivateKeyBytes) {
+    const { registerExactSvmScheme } = await import("@x402/svm/exact/client");
+    const { createKeyPairSignerFromPrivateKeyBytes } = await import("@solana/kit");
+    const solanaSigner = await createKeyPairSignerFromPrivateKeyBytes(solanaPrivateKeyBytes);
+    solanaAddress = solanaSigner.address;
+    registerExactSvmScheme(x402, { signer: solanaSigner });
+    console.log(`[ClawRouter] Solana x402 scheme registered: ${solanaAddress}`);
+  }
+
+  // Log which chain is used for each payment
+  x402.onAfterPaymentCreation(async (context) => {
+    const network = context.selectedRequirements.network;
+    const chain = network.startsWith("eip155")
+      ? "Base (EVM)"
+      : network.startsWith("solana")
+        ? "Solana"
+        : network;
+    console.log(`[ClawRouter] Payment signed on ${chain} (${network})`);
+  });
+
+  const payFetch = createPayFetchWithPreAuth(fetch, x402, undefined, {
+    skipPreAuth: paymentChain === "solana",
+  });
+
+  // Create balance monitor for pre-request checks (chain-appropriate)
+  const balanceMonitor: AnyBalanceMonitor =
+    paymentChain === "solana" && solanaAddress
+      ? new SolanaBalanceMonitor(solanaAddress)
+      : new BalanceMonitor(account.address);
 
   // Build router options (100% local — no external API calls for routing)
   const routingConfig = mergeRoutingConfig(options.routingConfig);
@@ -1138,7 +1628,11 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       const response: Record<string, unknown> = {
         status: "ok",
         wallet: account.address,
+        paymentChain,
       };
+      if (solanaAddress) {
+        response.solana = solanaAddress;
+      }
 
       if (full) {
         try {
@@ -1164,6 +1658,23 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
         "Cache-Control": "no-cache",
       });
       res.end(JSON.stringify(stats, null, 2));
+      return;
+    }
+
+    // Stats clear endpoint - delete all log files
+    if (req.url === "/stats" && req.method === "DELETE") {
+      try {
+        const result = await clearStats();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ cleared: true, deletedFiles: result.deletedFiles }));
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: `Failed to clear stats: ${err instanceof Error ? err.message : String(err)}`,
+          }),
+        );
+      }
       return;
     }
 
@@ -1270,11 +1781,15 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
 
         if (err.code === "EADDRINUSE") {
           // Port is in use - check if a proxy is actually running
-          const existingWallet = await checkExistingProxy(listenPort);
-          if (existingWallet) {
+          const existingProxy2 = await checkExistingProxy(listenPort);
+          if (existingProxy2) {
             // Proxy is actually running - this is fine, reuse it
             console.log(`[ClawRouter] Existing proxy detected on port ${listenPort}, reusing`);
-            rejectAttempt({ code: "REUSE_EXISTING", wallet: existingWallet });
+            rejectAttempt({
+              code: "REUSE_EXISTING",
+              wallet: existingProxy2.wallet,
+              existingChain: existingProxy2.paymentChain,
+            });
             return;
           }
 
@@ -1313,9 +1828,23 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       await tryListen(attempt);
       break; // Success
     } catch (err: unknown) {
-      const error = err as { code?: string; wallet?: string; attempt?: number };
+      const error = err as {
+        code?: string;
+        wallet?: string;
+        existingChain?: string;
+        attempt?: number;
+      };
 
       if (error.code === "REUSE_EXISTING" && error.wallet) {
+        // Validate payment chain matches (same check as pre-listen reuse path)
+        if (error.existingChain && error.existingChain !== paymentChain) {
+          throw new Error(
+            `Existing proxy on port ${listenPort} is using ${error.existingChain} but ${paymentChain} was requested. ` +
+              `Stop the existing proxy first or use a different port.`,
+            { cause: err },
+          );
+        }
+
         // Proxy is running, reuse it
         const baseUrl = `http://127.0.0.1:${listenPort}`;
         options.onReady?.(listenPort);
@@ -1402,6 +1931,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
     port,
     baseUrl,
     walletAddress: account.address,
+    solanaAddress,
     balanceMonitor,
     close: () =>
       new Promise<void>((res, rej) => {
@@ -1434,6 +1964,7 @@ type ModelRequestResult = {
   errorBody?: string;
   errorStatus?: number;
   isProviderError?: boolean;
+  isRateLimited?: boolean;
 };
 
 /**
@@ -1447,12 +1978,8 @@ async function tryModelRequest(
   body: Buffer,
   modelId: string,
   maxTokens: number,
-  payFetch: (
-    input: RequestInfo | URL,
-    init?: RequestInit,
-    preAuth?: PreAuthParams,
-  ) => Promise<Response>,
-  balanceMonitor: BalanceMonitor,
+  payFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
+  balanceMonitor: AnyBalanceMonitor,
   signal: AbortSignal,
 ): Promise<ModelRequestResult> {
   // Update model in body and normalize messages
@@ -1498,48 +2025,61 @@ async function tryModelRequest(
     // If body isn't valid JSON, use as-is
   }
 
-  // Estimate cost for pre-auth
-  const estimated = estimateAmount(modelId, requestBody.length, maxTokens);
-  const preAuth: PreAuthParams | undefined = estimated ? { estimatedAmount: estimated } : undefined;
-
   try {
-    const response = await payFetch(
-      upstreamUrl,
-      {
-        method,
-        headers,
-        body: requestBody.length > 0 ? new Uint8Array(requestBody) : undefined,
-        signal,
-      },
-      preAuth,
-    );
+    const dispatchUrl = resolveModelDispatchUrl(upstreamUrl, modelId);
+    const useLocalProxy = dispatchUrl !== upstreamUrl;
+    if (useLocalProxy) {
+      console.log(`[ClawRouter] Dispatching ${modelId} via local CLI proxy: ${dispatchUrl}`);
+    }
+
+    const requestFn = useLocalProxy ? fetch : payFetch;
+    const response = await requestFn(dispatchUrl, {
+      method,
+      headers,
+      body: requestBody.length > 0 ? new Uint8Array(requestBody) : undefined,
+      signal,
+    });
 
     // Check for provider errors
+    const contentType = response.headers.get("content-type") || "";
     if (response.status !== 200) {
-      // Clone response to read body without consuming it
       const errorBody = await response.text();
-      const isProviderErr = isProviderError(response.status, errorBody);
+      const classification = classifyProviderFailure({
+        status: response.status,
+        body: errorBody,
+        contentType,
+      });
 
       return {
         success: false,
         errorBody,
         errorStatus: response.status,
-        isProviderError: isProviderErr,
+        isProviderError: classification.isProviderError,
+        isRateLimited: classification.isRateLimited,
       };
     }
 
     // Detect provider degradation hidden inside HTTP 200 responses.
-    const contentType = response.headers.get("content-type") || "";
-    if (contentType.includes("json") || contentType.includes("text")) {
+    if (contentType.includes("json") || contentType.includes("text") || contentType.includes("x-ndjson")) {
       try {
         const responseBody = await response.clone().text();
-        const degradedReason = detectDegradedSuccessResponse(responseBody);
-        if (degradedReason) {
+        const classification = classifyProviderFailure({
+          status: response.status,
+          body: responseBody,
+          contentType,
+        });
+
+        if (classification.isProviderError) {
+          const syntheticErrorStatus = classification.isClientBug
+            ? 400
+            : 502;
+
           return {
             success: false,
-            errorBody: degradedReason,
-            errorStatus: 503,
-            isProviderError: true,
+            errorBody: classification.error?.message || "provider error in 200 response",
+            errorStatus: syntheticErrorStatus,
+            isProviderError: classification.isProviderError,
+            isRateLimited: classification.isRateLimited,
           };
         }
       } catch {
@@ -1565,23 +2105,18 @@ async function tryModelRequest(
  * Optimizations applied in order:
  *   1. Dedup check — if same request body seen within 30s, replay cached response
  *   2. Streaming heartbeat — for stream:true, send 200 + heartbeats immediately
- *   3. Payment pre-auth — estimate USDC amount and pre-sign to skip 402 round trip
- *   4. Smart routing — when model is "blockrun/auto", pick cheapest capable model
- *   5. Fallback chain — on provider errors, try next model in tier's fallback list
+ *   3. Smart routing — when model is "blockrun/auto", pick cheapest capable model
+ *   4. Fallback chain — on provider errors, try next model in tier's fallback list
  */
 async function proxyRequest(
   req: IncomingMessage,
   res: ServerResponse,
   apiBase: string,
-  payFetch: (
-    input: RequestInfo | URL,
-    init?: RequestInit,
-    preAuth?: PreAuthParams,
-  ) => Promise<Response>,
+  payFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
   options: ProxyOptions,
   routerOpts: RouterOptions,
   deduplicator: RequestDeduplicator,
-  balanceMonitor: BalanceMonitor,
+  balanceMonitor: AnyBalanceMonitor,
   sessionStore: SessionStore,
   responseCache: ResponseCache,
   sessionJournal: SessionJournal,
@@ -1601,17 +2136,25 @@ async function proxyRequest(
   // Track original context size for response headers
   const originalContextSizeKB = Math.ceil(body.length / 1024);
 
+  // Routing debug info is on by default; disable with x-clawrouter-debug: false
+  const debugMode = req.headers["x-clawrouter-debug"] !== "false";
+
   // --- Smart routing ---
   let routingDecision: RoutingDecision | undefined;
+  let hasTools = false; // true when request includes a tools schema
+  let hasVision = false; // true when request includes image_url content parts
   let isStreaming = false;
   let modelId = "";
   let maxTokens = 4096;
   let routingProfile: "free" | "eco" | "auto" | "premium" | null = null;
   let accumulatedContent = ""; // For session journal event extraction
+  let responseInputTokens: number | undefined;
   const isChatCompletion = req.url?.includes("/chat/completions");
 
-  // Extract session ID early for journal operations
+  // Extract session ID early for journal operations (header-only at this point)
   const sessionId = getSessionId(req.headers as Record<string, string | string[] | undefined>);
+  // Full session ID (header + content-derived) — populated once messages are parsed
+  let effectiveSessionId: string | undefined = sessionId;
 
   if (isChatCompletion && body.length > 0) {
     try {
@@ -1621,12 +2164,26 @@ async function proxyRequest(
       maxTokens = (parsed.max_tokens as number) || 4096;
       let bodyModified = false;
 
+      // Extract last user message content (used by session journal + /debug command)
+      const parsedMessages = Array.isArray(parsed.messages)
+        ? (parsed.messages as Array<{ role: string; content: unknown }>)
+        : [];
+      const lastUserMsg = [...parsedMessages].reverse().find((m) => m.role === "user");
+      const rawLastContent = lastUserMsg?.content;
+      const lastContent =
+        typeof rawLastContent === "string"
+          ? rawLastContent
+          : Array.isArray(rawLastContent)
+            ? (rawLastContent as Array<{ type: string; text?: string }>)
+                .filter((b) => b.type === "text")
+                .map((b) => b.text ?? "")
+                .join(" ")
+            : "";
+
       // --- Session Journal: Inject context if needed ---
       // Check if the last user message asks about past work
-      if (sessionId && Array.isArray(parsed.messages)) {
-        const messages = parsed.messages as Array<{ role: string; content: unknown }>;
-        const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-        const lastContent = typeof lastUserMsg?.content === "string" ? lastUserMsg.content : "";
+      if (sessionId && parsedMessages.length > 0) {
+        const messages = parsedMessages;
 
         if (sessionJournal.needsContext(lastContent)) {
           const journalText = sessionJournal.format(sessionId);
@@ -1648,6 +2205,344 @@ async function proxyRequest(
             );
           }
         }
+      }
+
+      // --- /debug command: return routing diagnostics without calling upstream ---
+      if (lastContent.startsWith("/debug")) {
+        const debugPrompt = lastContent.slice("/debug".length).trim() || "hello";
+        const messages = parsed.messages as Array<{ role: string; content: unknown }>;
+        const systemMsg = messages?.find((m) => m.role === "system");
+        const systemPrompt = typeof systemMsg?.content === "string" ? systemMsg.content : undefined;
+        const fullText = `${systemPrompt ?? ""} ${debugPrompt}`;
+        const estimatedTokens = Math.ceil(fullText.length / 4);
+
+        // Determine routing profile
+        const normalizedModel =
+          typeof parsed.model === "string" ? parsed.model.trim().toLowerCase() : "";
+        const profileName = normalizedModel.replace("blockrun/", "");
+        const debugProfile = (
+          ["free", "eco", "auto", "premium"].includes(profileName) ? profileName : "auto"
+        ) as "free" | "eco" | "auto" | "premium";
+
+        // Run scoring
+        const scoring = classifyByRules(
+          debugPrompt,
+          systemPrompt,
+          estimatedTokens,
+          DEFAULT_ROUTING_CONFIG.scoring,
+        );
+
+        // Run full routing decision
+        const debugRouting = route(debugPrompt, systemPrompt, maxTokens, {
+          ...routerOpts,
+          routingProfile: debugProfile,
+        });
+
+        // Format dimension scores
+        const dimLines = (scoring.dimensions ?? [])
+          .map((d) => {
+            const nameStr = (d.name + ":").padEnd(24);
+            const scoreStr = d.score.toFixed(2).padStart(6);
+            const sigStr = d.signal ? `  [${d.signal}]` : "";
+            return `  ${nameStr}${scoreStr}${sigStr}`;
+          })
+          .join("\n");
+
+        // Session info
+        const sess = sessionId ? sessionStore.getSession(sessionId) : undefined;
+        const sessLine = sess
+          ? `Session: ${sessionId!.slice(0, 8)}... → pinned: ${sess.model} (${sess.requestCount} requests)`
+          : sessionId
+            ? `Session: ${sessionId.slice(0, 8)}... → no pinned model`
+            : "Session: none";
+
+        const { simpleMedium, mediumComplex, complexReasoning } =
+          DEFAULT_ROUTING_CONFIG.scoring.tierBoundaries;
+
+        const debugText = [
+          "ClawRouter Debug",
+          "",
+          `Profile: ${debugProfile} | Tier: ${debugRouting.tier} | Model: ${debugRouting.model}`,
+          `Confidence: ${debugRouting.confidence.toFixed(2)} | Cost: $${debugRouting.costEstimate.toFixed(4)} | Savings: ${(debugRouting.savings * 100).toFixed(0)}%`,
+          `Reasoning: ${debugRouting.reasoning}`,
+          "",
+          `Scoring (weighted: ${scoring.score.toFixed(3)})`,
+          dimLines,
+          "",
+          `Tier Boundaries: SIMPLE <${simpleMedium.toFixed(2)} | MEDIUM <${mediumComplex.toFixed(2)} | COMPLEX <${complexReasoning.toFixed(2)} | REASONING >=${complexReasoning.toFixed(2)}`,
+          "",
+          sessLine,
+        ].join("\n");
+
+        // Build synthetic OpenAI chat completion response
+        const completionId = `chatcmpl-debug-${Date.now()}`;
+        const timestamp = Math.floor(Date.now() / 1000);
+        const syntheticResponse = {
+          id: completionId,
+          object: "chat.completion",
+          created: timestamp,
+          model: "clawrouter/debug",
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: debugText },
+              finish_reason: "stop",
+            },
+          ],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+
+        if (isStreaming) {
+          // SSE streaming response
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          });
+          const sseChunk = {
+            id: completionId,
+            object: "chat.completion.chunk",
+            created: timestamp,
+            model: "clawrouter/debug",
+            choices: [
+              {
+                index: 0,
+                delta: { role: "assistant", content: debugText },
+                finish_reason: null,
+              },
+            ],
+          };
+          const sseDone = {
+            id: completionId,
+            object: "chat.completion.chunk",
+            created: timestamp,
+            model: "clawrouter/debug",
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          };
+          res.write(`data: ${JSON.stringify(sseChunk)}\n\n`);
+          res.write(`data: ${JSON.stringify(sseDone)}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        } else {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(syntheticResponse));
+        }
+        console.log(`[ClawRouter] /debug command → ${debugRouting.tier} | ${debugRouting.model}`);
+        return;
+      }
+
+      // --- /imagegen command: generate an image via BlockRun image API ---
+      if (lastContent.startsWith("/imagegen")) {
+        const imageArgs = lastContent.slice("/imagegen".length).trim();
+
+        // Parse optional flags: /imagegen --model dall-e-3 --size 1792x1024 a cute cat
+        let imageModel = "google/nano-banana";
+        let imageSize = "1024x1024";
+        let imagePrompt = imageArgs;
+
+        // Extract --model flag
+        const modelMatch = imageArgs.match(/--model\s+(\S+)/);
+        if (modelMatch) {
+          const raw = modelMatch[1];
+          // Resolve shorthand aliases
+          const IMAGE_MODEL_ALIASES: Record<string, string> = {
+            "dall-e-3": "openai/dall-e-3",
+            dalle3: "openai/dall-e-3",
+            dalle: "openai/dall-e-3",
+            "gpt-image": "openai/gpt-image-1",
+            "gpt-image-1": "openai/gpt-image-1",
+            flux: "black-forest/flux-1.1-pro",
+            "flux-pro": "black-forest/flux-1.1-pro",
+            banana: "google/nano-banana",
+            "nano-banana": "google/nano-banana",
+            "banana-pro": "google/nano-banana-pro",
+            "nano-banana-pro": "google/nano-banana-pro",
+          };
+          imageModel = IMAGE_MODEL_ALIASES[raw] ?? raw;
+          imagePrompt = imagePrompt.replace(/--model\s+\S+/, "").trim();
+        }
+
+        // Extract --size flag
+        const sizeMatch = imageArgs.match(/--size\s+(\d+x\d+)/);
+        if (sizeMatch) {
+          imageSize = sizeMatch[1];
+          imagePrompt = imagePrompt.replace(/--size\s+\d+x\d+/, "").trim();
+        }
+
+        if (!imagePrompt) {
+          const errorText = [
+            "Usage: /imagegen <prompt>",
+            "",
+            "Options:",
+            "  --model <model>  Model to use (default: nano-banana)",
+            "  --size <WxH>     Image size (default: 1024x1024)",
+            "",
+            "Models:",
+            "  nano-banana       Google Gemini Flash — $0.05/image",
+            "  banana-pro        Google Gemini Pro — $0.10/image (up to 4K)",
+            "  dall-e-3          OpenAI DALL-E 3 — $0.04/image",
+            "  gpt-image         OpenAI GPT Image 1 — $0.02/image",
+            "  flux              Black Forest Flux 1.1 Pro — $0.04/image",
+            "",
+            "Examples:",
+            "  /imagegen a cat wearing sunglasses",
+            "  /imagegen --model dall-e-3 a futuristic city at sunset",
+            "  /imagegen --model banana-pro --size 2048x2048 mountain landscape",
+          ].join("\n");
+
+          const completionId = `chatcmpl-image-${Date.now()}`;
+          const timestamp = Math.floor(Date.now() / 1000);
+          if (isStreaming) {
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+            });
+            res.write(
+              `data: ${JSON.stringify({ id: completionId, object: "chat.completion.chunk", created: timestamp, model: "clawrouter/image", choices: [{ index: 0, delta: { role: "assistant", content: errorText }, finish_reason: null }] })}\n\n`,
+            );
+            res.write(
+              `data: ${JSON.stringify({ id: completionId, object: "chat.completion.chunk", created: timestamp, model: "clawrouter/image", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+            );
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } else {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                id: completionId,
+                object: "chat.completion",
+                created: timestamp,
+                model: "clawrouter/image",
+                choices: [
+                  {
+                    index: 0,
+                    message: { role: "assistant", content: errorText },
+                    finish_reason: "stop",
+                  },
+                ],
+                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+              }),
+            );
+          }
+          console.log(`[ClawRouter] /imagegen command → showing usage help`);
+          return;
+        }
+
+        // Call upstream image generation API
+        console.log(
+          `[ClawRouter] /imagegen command → ${imageModel} (${imageSize}): ${imagePrompt.slice(0, 80)}...`,
+        );
+        try {
+          const imageUpstreamUrl = `${apiBase}/v1/images/generations`;
+          const imageBody = JSON.stringify({
+            model: imageModel,
+            prompt: imagePrompt,
+            size: imageSize,
+            n: 1,
+          });
+          const imageResponse = await payFetch(imageUpstreamUrl, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": USER_AGENT },
+            body: imageBody,
+          });
+
+          const imageResult = (await imageResponse.json()) as {
+            created?: number;
+            data?: Array<{ url?: string; revised_prompt?: string }>;
+            error?: string | { message?: string };
+          };
+
+          let responseText: string;
+          if (!imageResponse.ok || imageResult.error) {
+            const errMsg =
+              typeof imageResult.error === "string"
+                ? imageResult.error
+                : ((imageResult.error as { message?: string })?.message ??
+                  `HTTP ${imageResponse.status}`);
+            responseText = `Image generation failed: ${errMsg}`;
+            console.log(`[ClawRouter] /imagegen error: ${errMsg}`);
+          } else {
+            const images = imageResult.data ?? [];
+            if (images.length === 0) {
+              responseText = "Image generation returned no results.";
+            } else {
+              const lines: string[] = [];
+              for (const img of images) {
+                if (img.url) {
+                  if (img.url.startsWith("data:")) {
+                    try {
+                      const hostedUrl = await uploadDataUriToHost(img.url);
+                      lines.push(hostedUrl);
+                    } catch (uploadErr) {
+                      console.error(
+                        `[ClawRouter] /imagegen: failed to upload data URI: ${uploadErr instanceof Error ? uploadErr.message : String(uploadErr)}`,
+                      );
+                      lines.push(
+                        "Image generated but upload failed. Try again or use --model dall-e-3.",
+                      );
+                    }
+                  } else {
+                    lines.push(img.url);
+                  }
+                }
+                if (img.revised_prompt) lines.push(`Revised prompt: ${img.revised_prompt}`);
+              }
+              lines.push("", `Model: ${imageModel} | Size: ${imageSize}`);
+              responseText = lines.join("\n");
+            }
+            console.log(`[ClawRouter] /imagegen success: ${images.length} image(s) generated`);
+          }
+
+          // Return as synthetic chat completion
+          const completionId = `chatcmpl-image-${Date.now()}`;
+          const timestamp = Math.floor(Date.now() / 1000);
+          if (isStreaming) {
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+            });
+            res.write(
+              `data: ${JSON.stringify({ id: completionId, object: "chat.completion.chunk", created: timestamp, model: "clawrouter/image", choices: [{ index: 0, delta: { role: "assistant", content: responseText }, finish_reason: null }] })}\n\n`,
+            );
+            res.write(
+              `data: ${JSON.stringify({ id: completionId, object: "chat.completion.chunk", created: timestamp, model: "clawrouter/image", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+            );
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } else {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                id: completionId,
+                object: "chat.completion",
+                created: timestamp,
+                model: "clawrouter/image",
+                choices: [
+                  {
+                    index: 0,
+                    message: { role: "assistant", content: responseText },
+                    finish_reason: "stop",
+                  },
+                ],
+                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+              }),
+            );
+          }
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          console.error(`[ClawRouter] /imagegen error: ${errMsg}`);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                error: { message: `Image generation failed: ${errMsg}`, type: "image_error" },
+              }),
+            );
+          }
+        }
+        return;
       }
 
       // Force stream: false — BlockRun API doesn't support streaming yet
@@ -1711,71 +2606,169 @@ async function proxyRequest(
         } else {
           // eco/auto/premium - use tier routing
           // Check for session persistence - use pinned model if available
-          const sessionId = getSessionId(
-            req.headers as Record<string, string | string[] | undefined>,
-          );
-          const existingSession = sessionId ? sessionStore.getSession(sessionId) : undefined;
+          // Fall back to deriving a session ID from message content when OpenClaw
+          // doesn't send an explicit x-session-id header (the default behaviour).
+          effectiveSessionId =
+            getSessionId(req.headers as Record<string, string | string[] | undefined>) ??
+            deriveSessionId(parsedMessages);
+          const existingSession = effectiveSessionId
+            ? sessionStore.getSession(effectiveSessionId)
+            : undefined;
+
+          // Extract prompt from last user message (handles both string and Anthropic array content)
+          const rawPrompt = lastUserMsg?.content;
+          const prompt =
+            typeof rawPrompt === "string"
+              ? rawPrompt
+              : Array.isArray(rawPrompt)
+                ? (rawPrompt as Array<{ type: string; text?: string }>)
+                    .filter((b) => b.type === "text")
+                    .map((b) => b.text ?? "")
+                    .join(" ")
+                : "";
+          const systemMsg = parsedMessages.find((m) => m.role === "system");
+          const systemPrompt =
+            typeof systemMsg?.content === "string" ? systemMsg.content : undefined;
+
+          // Tool detection — when tools are present, force agentic tiers for reliable tool use
+          const tools = parsed.tools as unknown[] | undefined;
+          hasTools = Array.isArray(tools) && tools.length > 0;
+
+          if (hasTools && tools) {
+            console.log(`[ClawRouter] Tools detected (${tools.length}), forcing agentic tiers`);
+          }
+
+          // Vision detection: scan messages for image_url content parts
+          hasVision = parsedMessages.some((m) => {
+            if (Array.isArray(m.content)) {
+              return (m.content as Array<{ type: string }>).some((p) => p.type === "image_url");
+            }
+            return false;
+          });
+          if (hasVision) {
+            console.log(`[ClawRouter] Vision content detected, filtering to vision-capable models`);
+          }
+
+          // Always route based on current request content
+          routingDecision = route(prompt, systemPrompt, maxTokens, {
+            ...routerOpts,
+            routingProfile: routingProfile ?? undefined,
+            hasTools,
+          });
 
           if (existingSession) {
-            // Use the session's pinned model instead of re-routing
-            console.log(
-              `[ClawRouter] Session ${sessionId?.slice(0, 8)}... using pinned model: ${existingSession.model}`,
-            );
-            parsed.model = existingSession.model;
-            modelId = existingSession.model;
-            bodyModified = true;
-            sessionStore.touchSession(sessionId!);
-          } else {
-            // No session or expired - route normally
-            // Extract prompt from messages
-            type ChatMessage = { role: string; content: string };
-            const messages = parsed.messages as ChatMessage[] | undefined;
-            let lastUserMsg: ChatMessage | undefined;
-            if (messages) {
-              for (let i = messages.length - 1; i >= 0; i--) {
-                if (messages[i].role === "user") {
-                  lastUserMsg = messages[i];
-                  break;
+            // Never downgrade: only upgrade the session when the current request needs a higher
+            // tier. This fixes the OpenClaw startup-message bias (the startup message always
+            // scores low-complexity, which previously pinned all subsequent real queries to a
+            // cheap model) while still preventing mid-task model switching on simple follow-ups.
+            const tierRank: Record<string, number> = {
+              SIMPLE: 0,
+              MEDIUM: 1,
+              COMPLEX: 2,
+              REASONING: 3,
+            };
+            const existingRank = tierRank[existingSession.tier] ?? 0;
+            const newRank = tierRank[routingDecision.tier] ?? 0;
+
+            if (newRank > existingRank) {
+              // Current request needs higher capability — upgrade the session
+              console.log(
+                `[ClawRouter] Session ${effectiveSessionId?.slice(0, 8)}... upgrading: ${existingSession.tier} → ${routingDecision.tier} (${routingDecision.model})`,
+              );
+              parsed.model = routingDecision.model;
+              modelId = routingDecision.model;
+              bodyModified = true;
+              if (effectiveSessionId) {
+                sessionStore.setSession(
+                  effectiveSessionId,
+                  routingDecision.model,
+                  routingDecision.tier,
+                );
+              }
+            } else {
+              // Keep existing higher-tier model (prevent downgrade mid-task)
+              console.log(
+                `[ClawRouter] Session ${effectiveSessionId?.slice(0, 8)}... keeping pinned model: ${existingSession.model} (${existingSession.tier} >= ${routingDecision.tier})`,
+              );
+              parsed.model = existingSession.model;
+              modelId = existingSession.model;
+              bodyModified = true;
+              sessionStore.touchSession(effectiveSessionId!);
+              // Reflect the actual model used in the routing decision for logging/fallback
+              routingDecision = {
+                ...routingDecision,
+                model: existingSession.model,
+                tier: existingSession.tier as Tier,
+              };
+            }
+
+            // --- Three-strike escalation: detect repetitive request patterns ---
+            const lastAssistantMsg = [...parsedMessages]
+              .reverse()
+              .find((m) => m.role === "assistant");
+            const assistantToolCalls = (
+              lastAssistantMsg as { tool_calls?: Array<{ function?: { name?: string } }> }
+            )?.tool_calls;
+            const toolCallNames = Array.isArray(assistantToolCalls)
+              ? assistantToolCalls
+                  .map((tc) => tc.function?.name)
+                  .filter((n): n is string => Boolean(n))
+              : undefined;
+            const contentHash = hashRequestContent(prompt, toolCallNames);
+            const shouldEscalate = sessionStore.recordRequestHash(effectiveSessionId!, contentHash);
+
+            if (shouldEscalate) {
+              const activeTierConfigs = (() => {
+                if (
+                  routingDecision.reasoning?.includes("agentic") &&
+                  routerOpts.config.agenticTiers
+                ) {
+                  return routerOpts.config.agenticTiers;
                 }
+                if (routingProfile === "eco" && routerOpts.config.ecoTiers) {
+                  return routerOpts.config.ecoTiers;
+                }
+                if (routingProfile === "premium" && routerOpts.config.premiumTiers) {
+                  return routerOpts.config.premiumTiers;
+                }
+                return routerOpts.config.tiers;
+              })();
+
+              const escalation = sessionStore.escalateSession(
+                effectiveSessionId!,
+                activeTierConfigs,
+              );
+              if (escalation) {
+                console.log(
+                  `[ClawRouter] ⚡ 3-strike escalation: ${existingSession.model} → ${escalation.model} (${existingSession.tier} → ${escalation.tier})`,
+                );
+                parsed.model = escalation.model;
+                modelId = escalation.model;
+                routingDecision = {
+                  ...routingDecision,
+                  model: escalation.model,
+                  tier: escalation.tier as Tier,
+                };
               }
             }
-            const systemMsg = messages?.find((m: ChatMessage) => m.role === "system");
-            const prompt = typeof lastUserMsg?.content === "string" ? lastUserMsg.content : "";
-            const systemPrompt =
-              typeof systemMsg?.content === "string" ? systemMsg.content : undefined;
-
-            // Tool detection no longer forces agentic mode
-            // Agentic mode is now triggered by keyword-based detection (agenticScore >= 0.6)
-            // This allows simple queries with tools to use cheaper models
-            const tools = parsed.tools as unknown[] | undefined;
-            const hasTools = Array.isArray(tools) && tools.length > 0;
-
-            if (hasTools && tools) {
-              console.log(
-                `[ClawRouter] Tools detected (${tools.length}), agentic mode via keywords`,
-              );
-            }
-
-            routingDecision = route(prompt, systemPrompt, maxTokens, {
-              ...routerOpts,
-              routingProfile: routingProfile ?? undefined,
-            });
-
-            // Replace model in body
+          } else {
+            // No session — pin this routing decision for future requests
             parsed.model = routingDecision.model;
             modelId = routingDecision.model;
             bodyModified = true;
-
-            // Pin this model to the session for future requests
-            if (sessionId) {
-              sessionStore.setSession(sessionId, routingDecision.model, routingDecision.tier);
+            if (effectiveSessionId) {
+              sessionStore.setSession(
+                effectiveSessionId,
+                routingDecision.model,
+                routingDecision.tier,
+              );
               console.log(
-                `[ClawRouter] Session ${sessionId.slice(0, 8)}... pinned to model: ${routingDecision.model}`,
+                `[ClawRouter] Session ${effectiveSessionId.slice(0, 8)}... pinned to model: ${routingDecision.model}`,
               );
             }
-
-            options.onRouted?.(routingDecision);
           }
+
+          options.onRouted?.(routingDecision);
         }
       }
 
@@ -1893,6 +2886,7 @@ async function proxyRequest(
   // Estimate cost and check if wallet has sufficient balance
   // Skip if skipBalanceCheck is set (for testing) or if using free model
   let estimatedCostMicros: bigint | undefined;
+  let balanceFallbackNotice: string | undefined;
   const isFreeModel = modelId === FREE_MODEL;
 
   if (modelId && !options.skipBalanceCheck && !isFreeModel) {
@@ -1913,13 +2907,18 @@ async function proxyRequest(
         // This ensures new users with empty wallets can still use ClawRouter
         const originalModel = modelId;
         console.log(
-          `[ClawRouter] Wallet ${sufficiency.info.isEmpty ? "empty" : "insufficient"} ($${sufficiency.info.balanceUSD}), falling back to free model: ${FREE_MODEL} (requested: ${originalModel})`,
+          `[ClawRouter] Wallet ${sufficiency.info.isEmpty ? "empty" : "insufficient"} (${sufficiency.info.balanceUSD}), falling back to free model: ${FREE_MODEL} (requested: ${originalModel})`,
         );
         modelId = FREE_MODEL;
         // Update the body with new model
         const parsed = JSON.parse(body.toString()) as Record<string, unknown>;
         parsed.model = FREE_MODEL;
         body = Buffer.from(JSON.stringify(parsed));
+
+        // Set notice to prepend to response so user knows about the fallback
+        balanceFallbackNotice = sufficiency.info.isEmpty
+          ? `> **⚠️ Wallet empty** — using free model. Fund your wallet to use ${originalModel}.\n\n`
+          : `> **⚠️ Insufficient balance** (${sufficiency.info.balanceUSD}) — using free model instead of ${originalModel}.\n\n`;
 
         // Notify about the fallback
         options.onLowBalance?.({
@@ -2013,12 +3012,20 @@ async function proxyRequest(
       const estimatedInputTokens = Math.ceil(body.length / 4);
       const estimatedTotalTokens = estimatedInputTokens + maxTokens;
 
-      // Get tier configs (use agentic tiers if routing decided to use them)
-      const useAgenticTiers =
-        routingDecision.reasoning?.includes("agentic") && routerOpts.config.agenticTiers;
-      const tierConfigs = useAgenticTiers
-        ? routerOpts.config.agenticTiers!
-        : routerOpts.config.tiers;
+      // Get tier configs matching the profile that was used for routing
+      // Must stay in sync with what route() selected in router/index.ts
+      const tierConfigs = (() => {
+        if (routingDecision.reasoning?.includes("agentic") && routerOpts.config.agenticTiers) {
+          return routerOpts.config.agenticTiers;
+        }
+        if (routingProfile === "eco" && routerOpts.config.ecoTiers) {
+          return routerOpts.config.ecoTiers;
+        }
+        if (routingProfile === "premium" && routerOpts.config.premiumTiers) {
+          return routerOpts.config.premiumTiers;
+        }
+        return routerOpts.config.tiers;
+      })();
 
       // Get full chain first, then filter by context
       const fullChain = getFallbackChain(routingDecision.tier, tierConfigs);
@@ -2037,19 +3044,60 @@ async function proxyRequest(
         );
       }
 
+      // Filter to models that support tool calling when request has tools.
+      // Prevents models like grok-code-fast-1 from outputting tool invocations
+      // as plain text JSON (the "talking to itself" bug).
+      let toolFiltered = filterByToolCalling(contextFiltered, hasTools, supportsToolCalling);
+      const toolExcluded = contextFiltered.filter((m) => !toolFiltered.includes(m));
+      if (toolExcluded.length > 0) {
+        console.log(
+          `[ClawRouter] Tool-calling filter: excluded ${toolExcluded.join(", ")} (no structured function call support)`,
+        );
+      }
+
+      // Filter out models that declare toolCalling but fail tool compliance in practice.
+      // gemini-2.5-flash-lite refuses certain tool schemas (e.g. brave search) while
+      // cheaper models like nvidia/gpt-oss-120b handle them fine.
+      const TOOL_NONCOMPLIANT_MODELS = [
+        "google/gemini-2.5-flash-lite",
+        "google/gemini-3-pro-preview",
+        "google/gemini-3.1-pro",
+      ];
+      if (hasTools && toolFiltered.length > 1) {
+        const compliant = toolFiltered.filter((m) => !TOOL_NONCOMPLIANT_MODELS.includes(m));
+        if (compliant.length > 0 && compliant.length < toolFiltered.length) {
+          const dropped = toolFiltered.filter((m) => TOOL_NONCOMPLIANT_MODELS.includes(m));
+          console.log(
+            `[ClawRouter] Tool-compliance filter: excluded ${dropped.join(", ")} (unreliable tool schema handling)`,
+          );
+          toolFiltered = compliant;
+        }
+      }
+
+      // Filter to models that support vision when request has image_url content
+      const visionFiltered = filterByVision(toolFiltered, hasVision, supportsVision);
+      const visionExcluded = toolFiltered.filter((m) => !visionFiltered.includes(m));
+      if (visionExcluded.length > 0) {
+        console.log(
+          `[ClawRouter] Vision filter: excluded ${visionExcluded.join(", ")} (no vision support)`,
+        );
+      }
+
       // Limit to MAX_FALLBACK_ATTEMPTS to prevent infinite loops
-      modelsToTry = contextFiltered.slice(0, MAX_FALLBACK_ATTEMPTS);
+      modelsToTry = visionFiltered.slice(0, MAX_FALLBACK_ATTEMPTS);
 
       // Deprioritize rate-limited models (put them at the end)
       modelsToTry = prioritizeNonRateLimited(modelsToTry);
     } else {
-      // For explicit model requests, add free model as emergency fallback
-      // in case the primary model fails due to insufficient funds mid-request
-      if (modelId && modelId !== FREE_MODEL) {
-        modelsToTry = [modelId, FREE_MODEL];
-      } else {
-        modelsToTry = modelId ? [modelId] : [];
-      }
+      // For explicit model requests, use the requested model
+      modelsToTry = modelId ? [modelId] : [];
+    }
+
+    // Always ensure free model is the last-resort fallback.
+    // If all paid models fail (insufficient funds, rate limits, etc.),
+    // the user still gets a response instead of an error.
+    if (!modelsToTry.includes(FREE_MODEL)) {
+      modelsToTry.push(FREE_MODEL);
     }
 
     // --- Fallback loop: try each model until success ---
@@ -2090,10 +3138,26 @@ async function proxyRequest(
 
       // If it's a provider error and not the last attempt, try next model
       if (result.isProviderError && !isLastAttempt) {
-        // Track 429 rate limits to deprioritize this model for future requests
-        if (result.errorStatus === 429) {
+        // Track provider rate limits to deprioritize this model for future requests
+        if ((result.errorStatus === 429) || result.isRateLimited) {
           markRateLimited(tryModel);
         }
+
+        // Payment error (insufficient funds, simulation failure) — skip remaining
+        // paid models, jump straight to free model. No point trying other paid
+        // models with the same wallet state.
+        const isPaymentErr = /payment.*verification.*failed|payment.*settlement.*failed|insufficient.*funds|transaction_simulation_failed/i.test(
+          result.errorBody || "",
+        );
+        if (isPaymentErr && tryModel !== FREE_MODEL) {
+          const freeIdx = modelsToTry.indexOf(FREE_MODEL);
+          if (freeIdx > i + 1) {
+            console.log(`[ClawRouter] Payment error — skipping to free model: ${FREE_MODEL}`);
+            i = freeIdx - 1; // loop will increment to freeIdx
+            continue;
+          }
+        }
+
         console.log(
           `[ClawRouter] Provider error from ${tryModel}, trying fallback: ${result.errorBody?.slice(0, 100)}`,
         );
@@ -2118,6 +3182,14 @@ async function proxyRequest(
       heartbeatInterval = undefined;
     }
 
+    // --- Emit routing debug info (opt-in via x-clawrouter-debug: true header) ---
+    // For streaming: SSE comment (invisible to most clients, visible in raw stream)
+    // For non-streaming: response headers added later
+    if (debugMode && headersSentEarly && routingDecision) {
+      const debugComment = `: x-clawrouter-debug profile=${routingProfile ?? "auto"} tier=${routingDecision.tier} model=${actualModelUsed} agentic=${routingDecision.agenticScore?.toFixed(2) ?? "n/a"} confidence=${routingDecision.confidence.toFixed(2)} reasoning=${routingDecision.reasoning}\n\n`;
+      safeWrite(res, debugComment);
+    }
+
     // Update routing decision with actual model used (for logging)
     // IMPORTANT: Recalculate cost for the actual model, not the original primary
     if (routingDecision && actualModelUsed !== routingDecision.model) {
@@ -2138,6 +3210,16 @@ async function proxyRequest(
         savings: newCosts.savings,
       };
       options.onRouted?.(routingDecision);
+
+      // Update session pin to the actual model used — ensures the next request in
+      // this conversation starts from the fallback model rather than retrying the
+      // primary and falling back again (prevents the "model keeps jumping" issue).
+      if (effectiveSessionId) {
+        sessionStore.setSession(effectiveSessionId, actualModelUsed, routingDecision.tier);
+        console.log(
+          `[ClawRouter] Session ${effectiveSessionId.slice(0, 8)}... updated pin to fallback: ${actualModelUsed}`,
+        );
+      }
     }
 
     // --- Handle case where all models failed ---
@@ -2249,6 +3331,12 @@ async function proxyRequest(
             usage?: unknown;
           };
 
+          // Extract input token count from upstream response
+          if (rsp.usage && typeof rsp.usage === "object") {
+            const u = rsp.usage as Record<string, unknown>;
+            if (typeof u.prompt_tokens === "number") responseInputTokens = u.prompt_tokens;
+          }
+
           // Build base chunk structure (reused for all chunks)
           // Match OpenAI's exact format including system_fingerprint
           const baseChunk = {
@@ -2281,6 +3369,25 @@ async function proxyRequest(
               const roleData = `data: ${JSON.stringify(roleChunk)}\n\n`;
               safeWrite(res, roleData);
               responseChunks.push(Buffer.from(roleData));
+
+              // Chunk 1.5: balance fallback notice (tells user they got free model)
+              if (balanceFallbackNotice) {
+                const noticeChunk = {
+                  ...baseChunk,
+                  choices: [
+                    {
+                      index,
+                      delta: { content: balanceFallbackNotice },
+                      logprobs: null,
+                      finish_reason: null,
+                    },
+                  ],
+                };
+                const noticeData = `data: ${JSON.stringify(noticeChunk)}\n\n`;
+                safeWrite(res, noticeData);
+                responseChunks.push(Buffer.from(noticeData));
+                balanceFallbackNotice = undefined; // Only inject once
+              }
 
               // Chunk 2: content (single chunk with full content)
               if (content) {
@@ -2366,26 +3473,58 @@ async function proxyRequest(
       responseHeaders["x-context-used-kb"] = String(originalContextSizeKB);
       responseHeaders["x-context-limit-kb"] = String(CONTEXT_LIMIT_KB);
 
-      res.writeHead(upstream.status, responseHeaders);
+      // Add routing debug headers (opt-in via x-clawrouter-debug: true header)
+      if (debugMode && routingDecision) {
+        responseHeaders["x-clawrouter-profile"] = routingProfile ?? "auto";
+        responseHeaders["x-clawrouter-tier"] = routingDecision.tier;
+        responseHeaders["x-clawrouter-model"] = actualModelUsed;
+        responseHeaders["x-clawrouter-confidence"] = routingDecision.confidence.toFixed(2);
+        responseHeaders["x-clawrouter-reasoning"] = routingDecision.reasoning;
+        if (routingDecision.agenticScore !== undefined) {
+          responseHeaders["x-clawrouter-agentic-score"] = routingDecision.agenticScore.toFixed(2);
+        }
+      }
 
+      // Collect full body for possible notice injection
+      const bodyParts: Buffer[] = [];
       if (upstream.body) {
         const reader = upstream.body.getReader();
         try {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            const chunk = Buffer.from(value);
-            safeWrite(res, chunk);
-            responseChunks.push(chunk);
+            bodyParts.push(Buffer.from(value));
           }
         } finally {
           reader.releaseLock();
         }
       }
 
-      res.end();
+      let responseBody = Buffer.concat(bodyParts);
 
-      const responseBody = Buffer.concat(responseChunks);
+      // Prepend balance fallback notice to response content
+      if (balanceFallbackNotice && responseBody.length > 0) {
+        try {
+          const parsed = JSON.parse(responseBody.toString()) as {
+            choices?: Array<{ message?: { content?: string } }>;
+          };
+          if (parsed.choices?.[0]?.message?.content !== undefined) {
+            parsed.choices[0].message.content =
+              balanceFallbackNotice + parsed.choices[0].message.content;
+            responseBody = Buffer.from(JSON.stringify(parsed));
+          }
+        } catch {
+          /* not JSON, skip notice */
+        }
+        balanceFallbackNotice = undefined;
+      }
+
+      // Update content-length header since body may have changed
+      responseHeaders["content-length"] = String(responseBody.length);
+      res.writeHead(upstream.status, responseHeaders);
+      safeWrite(res, responseBody);
+      responseChunks.push(responseBody);
+      res.end();
 
       // Cache for dedup (short-term, 30s)
       deduplicator.complete(dedupKey, {
@@ -2408,13 +3547,18 @@ async function proxyRequest(
         );
       }
 
-      // Extract content from non-streaming response for session journal
+      // Extract content and token usage from non-streaming response
       try {
         const rspJson = JSON.parse(responseBody.toString()) as {
           choices?: Array<{ message?: { content?: string } }>;
+          usage?: Record<string, unknown>;
         };
         if (rspJson.choices?.[0]?.message?.content) {
           accumulatedContent = rspJson.choices[0].message.content;
+        }
+        if (rspJson.usage && typeof rspJson.usage === "object") {
+          if (typeof rspJson.usage.prompt_tokens === "number")
+            responseInputTokens = rspJson.usage.prompt_tokens;
         }
       } catch {
         // Ignore parse errors - journal just won't have content for this response
@@ -2457,7 +3601,7 @@ async function proxyRequest(
 
     // Convert abort error to more descriptive timeout error
     if (err instanceof Error && err.name === "AbortError") {
-      throw new Error(`Request timed out after ${timeoutMs}ms`);
+      throw new Error(`Request timed out after ${timeoutMs}ms`, { cause: err });
     }
 
     throw err;
@@ -2478,7 +3622,7 @@ async function proxyRequest(
       maxTokens,
       routingProfile ?? undefined,
     );
-    // Apply 20% buffer to match x402 pre-auth
+    // Apply 20% buffer for cost estimation accuracy
     const costWithBuffer = accurateCosts.costEstimate * 1.2;
     const baselineWithBuffer = accurateCosts.baselineCost * 1.2;
     const entry: UsageEntry = {
@@ -2489,6 +3633,7 @@ async function proxyRequest(
       baselineCost: baselineWithBuffer,
       savings: accurateCosts.savings,
       latencyMs: Date.now() - startTime,
+      ...(responseInputTokens !== undefined && { inputTokens: responseInputTokens }),
     };
     logUsage(entry).catch(() => {});
   }

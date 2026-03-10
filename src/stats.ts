@@ -5,7 +5,7 @@
  * Supports filtering by date range and provides multiple aggregation views.
  */
 
-import { readdir } from "node:fs/promises";
+import { readdir, unlink } from "node:fs/promises";
 import { readTextFile } from "./fs-read.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -48,19 +48,24 @@ async function parseLogFile(filePath: string): Promise<UsageEntry[]> {
   try {
     const content = await readTextFile(filePath);
     const lines = content.trim().split("\n").filter(Boolean);
-    return lines.map((line) => {
-      const entry = JSON.parse(line) as Partial<UsageEntry>;
-      // Handle old format entries
-      return {
-        timestamp: entry.timestamp || new Date().toISOString(),
-        model: entry.model || "unknown",
-        tier: entry.tier || "UNKNOWN",
-        cost: entry.cost || 0,
-        baselineCost: entry.baselineCost || entry.cost || 0,
-        savings: entry.savings || 0,
-        latencyMs: entry.latencyMs || 0,
-      };
-    });
+    const entries: UsageEntry[] = [];
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line) as Partial<UsageEntry>;
+        entries.push({
+          timestamp: entry.timestamp || new Date().toISOString(),
+          model: entry.model || "unknown",
+          tier: entry.tier || "UNKNOWN",
+          cost: entry.cost || 0,
+          baselineCost: entry.baselineCost || entry.cost || 0,
+          savings: entry.savings || 0,
+          latencyMs: entry.latencyMs || 0,
+        });
+      } catch {
+        // Skip malformed lines, keep valid ones
+      }
+    }
+    return entries;
   } catch {
     return [];
   }
@@ -288,4 +293,20 @@ export function formatStatsAscii(stats: AggregatedStats): string {
   lines.push("╚════════════════════════════════════════════════════════════╝");
 
   return lines.join("\n");
+}
+
+/**
+ * Delete all usage log files, resetting stats to zero.
+ */
+export async function clearStats(): Promise<{ deletedFiles: number }> {
+  try {
+    const files = await readdir(LOG_DIR);
+    const logFiles = files.filter((f) => f.startsWith("usage-") && f.endsWith(".jsonl"));
+
+    await Promise.all(logFiles.map((f) => unlink(join(LOG_DIR, f))));
+
+    return { deletedFiles: logFiles.length };
+  } catch {
+    return { deletedFiles: 0 };
+  }
 }

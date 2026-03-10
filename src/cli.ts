@@ -14,8 +14,9 @@
  */
 
 import { startProxy, getProxyPort } from "./proxy.js";
-import { resolveOrGenerateWalletKey } from "./auth.js";
-import { BalanceMonitor } from "./balance.js";
+import { resolveOrGenerateWalletKey, resolvePaymentChain } from "./auth.js";
+import { getSolanaAddress } from "./wallet.js";
+import { generateReport } from "./report.js";
 import { VERSION } from "./version.js";
 import { runDoctor } from "./doctor.js";
 import { PARTNER_SERVICES } from "./partners/index.js";
@@ -28,6 +29,7 @@ Usage:
   clawrouter [options]
   clawrouter doctor [opus] [question]
   clawrouter partners [test]
+  clawrouter report [daily|weekly|monthly] [--json]
 
 Options:
   --version, -v     Show version number
@@ -70,6 +72,9 @@ function parseArgs(args: string[]): {
   doctor: boolean;
   partners: boolean;
   partnersTest: boolean;
+  report: boolean;
+  reportPeriod: "daily" | "weekly" | "monthly";
+  reportJson: boolean;
   port?: number;
 } {
   const result = {
@@ -78,6 +83,9 @@ function parseArgs(args: string[]): {
     doctor: false,
     partners: false,
     partnersTest: false,
+    report: false,
+    reportPeriod: "daily" as "daily" | "weekly" | "monthly",
+    reportJson: false,
     port: undefined as number | undefined,
   };
 
@@ -94,6 +102,20 @@ function parseArgs(args: string[]): {
       // Check for "test" subcommand
       if (args[i + 1] === "test") {
         result.partnersTest = true;
+        i++;
+      }
+    } else if (arg === "report") {
+      result.report = true;
+      const next = args[i + 1];
+      if (next && ["daily", "weekly", "monthly"].includes(next)) {
+        result.reportPeriod = next as "daily" | "weekly" | "monthly";
+        i++;
+        if (args[i + 1] === "--json") {
+          result.reportJson = true;
+          i++;
+        }
+      } else if (next === "--json") {
+        result.reportJson = true;
         i++;
       }
     } else if (arg === "--port" && args[i + 1]) {
@@ -154,7 +176,9 @@ async function main(): Promise<void> {
       console.log(`    ${svc.description}`);
       console.log(`    Tool:    blockrun_${svc.id}`);
       console.log(`    Method:  ${svc.method} /v1${svc.proxyPath}`);
-      console.log(`    Pricing: ${svc.pricing.perUnit} per ${svc.pricing.unit} (min ${svc.pricing.minimum}, max ${svc.pricing.maximum})`);
+      console.log(
+        `    Pricing: ${svc.pricing.perUnit} per ${svc.pricing.unit} (min ${svc.pricing.minimum}, max ${svc.pricing.maximum})`,
+      );
       console.log();
     }
 
@@ -178,20 +202,36 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // Resolve wallet key
-  const { key: walletKey, address, source } = await resolveOrGenerateWalletKey();
+  if (args.report) {
+    const report = await generateReport(args.reportPeriod, args.reportJson);
+    console.log(report);
+    process.exit(0);
+  }
 
-  if (source === "generated") {
-    console.log(`[ClawRouter] Generated new wallet: ${address}`);
-  } else if (source === "saved") {
-    console.log(`[ClawRouter] Using saved wallet: ${address}`);
+  // Resolve wallet key
+  const wallet = await resolveOrGenerateWalletKey();
+
+  if (wallet.source === "generated") {
+    console.log(`[ClawRouter] Generated new wallet: ${wallet.address}`);
+  } else if (wallet.source === "saved") {
+    console.log(`[ClawRouter] Using saved wallet: ${wallet.address}`);
   } else {
-    console.log(`[ClawRouter] Using wallet from BLOCKRUN_WALLET_KEY: ${address}`);
+    console.log(`[ClawRouter] Using wallet from BLOCKRUN_WALLET_KEY: ${wallet.address}`);
+  }
+
+  // Show Solana address if available
+  if (wallet.solanaPrivateKeyBytes) {
+    try {
+      const solAddr = await getSolanaAddress(wallet.solanaPrivateKeyBytes);
+      console.log(`[ClawRouter] Solana address: ${solAddr}`);
+    } catch {
+      // Non-fatal
+    }
   }
 
   // Start the proxy
   const proxy = await startProxy({
-    walletKey,
+    wallet,
     port: args.port,
     onReady: (port) => {
       console.log(`[ClawRouter] Proxy listening on http://127.0.0.1:${port}`);
@@ -216,20 +256,22 @@ async function main(): Promise<void> {
     },
   });
 
-  // Check balance
-  const monitor = new BalanceMonitor(address);
+  // Check balance on the active payment chain
+  const paymentChain = await resolvePaymentChain();
+  const displayAddress =
+    paymentChain === "solana" && proxy.solanaAddress ? proxy.solanaAddress : wallet.address;
   try {
-    const balance = await monitor.checkBalance();
+    const balance = await proxy.balanceMonitor.checkBalance();
     if (balance.isEmpty) {
       console.log(`[ClawRouter] Wallet balance: $0.00 (using FREE model)`);
-      console.log(`[ClawRouter] Fund wallet for premium models: ${address}`);
+      console.log(`[ClawRouter] Fund wallet for premium models: ${displayAddress}`);
     } else if (balance.isLow) {
       console.log(`[ClawRouter] Wallet balance: ${balance.balanceUSD} (low)`);
     } else {
       console.log(`[ClawRouter] Wallet balance: ${balance.balanceUSD}`);
     }
   } catch {
-    console.log(`[ClawRouter] Wallet: ${address} (balance check pending)`);
+    console.log(`[ClawRouter] Wallet: ${displayAddress} (balance check pending)`);
   }
 
   console.log(`[ClawRouter] Ready - Ctrl+C to stop`);

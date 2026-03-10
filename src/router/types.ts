@@ -16,6 +16,7 @@ export type ScoringResult = {
   confidence: number; // sigmoid-calibrated [0, 1]
   signals: string[];
   agenticScore?: number; // 0-1 agentic task score for auto-switching to agentic tiers
+  dimensions?: Array<{ name: string; score: number; signal: string | null }>; // per-dimension breakdown for /debug
 };
 
 export type RoutingDecision = {
@@ -27,6 +28,7 @@ export type RoutingDecision = {
   costEstimate: number;
   baselineCost: number;
   savings: number; // 0-1 percentage
+  agenticScore?: number; // 0-1 agentic task score (present when tier routing used)
 };
 
 export type TierConfig = {

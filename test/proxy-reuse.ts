@@ -89,7 +89,7 @@ console.log("\n═══ Part 2: Proxy Reuse ═══\n");
     // Start first proxy
     console.log("\n  Starting first proxy...");
     const proxy1 = await startProxy({
-      walletKey,
+      wallet: walletKey,
       port: testPort,
       onReady: (port) => console.log(`  First proxy ready on port ${port}`),
     });
@@ -108,7 +108,7 @@ console.log("\n═══ Part 2: Proxy Reuse ═══\n");
     // Start second proxy on same port — should reuse
     console.log("\n  Starting second proxy (should reuse)...");
     const proxy2 = await startProxy({
-      walletKey,
+      wallet: walletKey,
       port: testPort,
       onReady: (port) => console.log(`  Second proxy ready on port ${port}`),
     });
@@ -174,7 +174,7 @@ console.log("\n═══ Part 3: Different Wallet Warning ═══\n");
     // Start proxy with wallet 1
     console.log("\n  Starting proxy with wallet 1...");
     const proxy1 = await startProxy({
-      walletKey: walletKey1,
+      wallet: walletKey1,
       port: testPort,
       onReady: (port) => console.log(`  Proxy 1 ready on port ${port}`),
     });
@@ -184,7 +184,7 @@ console.log("\n═══ Part 3: Different Wallet Warning ═══\n");
     // Start proxy with wallet 2 on same port — should reuse but return existing wallet
     console.log("\n  Starting proxy with wallet 2 (should reuse existing with wallet 1)...");
     const proxy2 = await startProxy({
-      walletKey: walletKey2,
+      wallet: walletKey2,
       port: testPort,
       onReady: (port) => console.log(`  Proxy 2 ready on port ${port}`),
     });

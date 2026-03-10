@@ -14,6 +14,11 @@ export type ModelPricing = {
 
 const BASELINE_MODEL_ID = "anthropic/claude-opus-4.6";
 
+// Hardcoded fallback: Claude Opus 4.6 pricing (per 1M tokens)
+// Used when baseline model not found in dynamic pricing map
+const BASELINE_INPUT_PRICE = 5.0;
+const BASELINE_OUTPUT_PRICE = 25.0;
+
 /**
  * Select the primary model for a tier and build the RoutingDecision.
  */
@@ -27,6 +32,7 @@ export function selectModel(
   estimatedInputTokens: number,
   maxOutputTokens: number,
   routingProfile?: "free" | "eco" | "auto" | "premium",
+  agenticScore?: number,
 ): RoutingDecision {
   const tierConfig = tierConfigs[tier];
   const model = tierConfig.primary;
@@ -41,8 +47,8 @@ export function selectModel(
 
   // Baseline: what Claude Opus 4.5 would cost (the premium reference)
   const opusPricing = modelPricing.get(BASELINE_MODEL_ID);
-  const opusInputPrice = opusPricing?.inputPrice ?? 0;
-  const opusOutputPrice = opusPricing?.outputPrice ?? 0;
+  const opusInputPrice = opusPricing?.inputPrice ?? BASELINE_INPUT_PRICE;
+  const opusOutputPrice = opusPricing?.outputPrice ?? BASELINE_OUTPUT_PRICE;
   const baselineInput = (estimatedInputTokens / 1_000_000) * opusInputPrice;
   const baselineOutput = (maxOutputTokens / 1_000_000) * opusOutputPrice;
   const baselineCost = baselineInput + baselineOutput;
@@ -64,6 +70,7 @@ export function selectModel(
     costEstimate,
     baselineCost,
     savings,
+    ...(agenticScore !== undefined && { agenticScore }),
   };
 }
 
@@ -97,8 +104,8 @@ export function calculateModelCost(
 
   // Baseline: what Claude Opus 4.5 would cost (the premium reference)
   const opusPricing = modelPricing.get(BASELINE_MODEL_ID);
-  const opusInputPrice = opusPricing?.inputPrice ?? 0;
-  const opusOutputPrice = opusPricing?.outputPrice ?? 0;
+  const opusInputPrice = opusPricing?.inputPrice ?? BASELINE_INPUT_PRICE;
+  const opusOutputPrice = opusPricing?.outputPrice ?? BASELINE_OUTPUT_PRICE;
   const baselineInput = (estimatedInputTokens / 1_000_000) * opusInputPrice;
   const baselineOutput = (maxOutputTokens / 1_000_000) * opusOutputPrice;
   const baselineCost = baselineInput + baselineOutput;
@@ -112,6 +119,38 @@ export function calculateModelCost(
         : 0;
 
   return { costEstimate, baselineCost, savings };
+}
+
+/**
+ * Filter a model list to only those that support tool calling.
+ * When hasTools is false, returns the list unchanged.
+ * When all models lack tool calling support, returns the full list as a fallback
+ * (better to let the API error than produce an empty chain).
+ */
+export function filterByToolCalling(
+  models: string[],
+  hasTools: boolean,
+  supportsToolCalling: (modelId: string) => boolean,
+): string[] {
+  if (!hasTools) return models;
+  const filtered = models.filter(supportsToolCalling);
+  return filtered.length > 0 ? filtered : models;
+}
+
+/**
+ * Filter a model list to only those that support vision (image inputs).
+ * When hasVision is false, returns the list unchanged.
+ * When all models lack vision support, returns the full list as a fallback
+ * (better to let the API error than produce an empty chain).
+ */
+export function filterByVision(
+  models: string[],
+  hasVision: boolean,
+  supportsVision: (modelId: string) => boolean,
+): string[] {
+  if (!hasVision) return models;
+  const filtered = models.filter(supportsVision);
+  return filtered.length > 0 ? filtered : models;
 }
 
 /**

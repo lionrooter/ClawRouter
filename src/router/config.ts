@@ -1049,22 +1049,22 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
       ],
     },
     MEDIUM: {
-      primary: "xai/grok-code-fast-1", // Code specialist, $0.20/$1.50
+      primary: "moonshot/kimi-k2.5", // $0.50/$2.40 - strong tool use, proper function call format
       fallback: [
-        "google/gemini-2.5-flash-lite", // 1M context, ultra cheap ($0.10/$0.40)
         "deepseek/deepseek-chat",
+        "google/gemini-2.5-flash-lite", // 1M context, ultra cheap ($0.10/$0.40)
         "xai/grok-4-1-fast-non-reasoning", // Upgraded Grok 4.1
       ],
     },
     COMPLEX: {
-      primary: "google/gemini-3.1-pro-preview", // Newest Gemini 3.1 - upgraded from 3.0
+      primary: "google/gemini-3.1-pro", // Newest Gemini 3.1 - upgraded from 3.0
       fallback: [
         "google/gemini-2.5-flash-lite", // CRITICAL: 1M context, ultra-cheap failsafe ($0.10/$0.40)
         "google/gemini-3-pro-preview", // 3.0 fallback
         "google/gemini-2.5-pro",
         "deepseek/deepseek-chat",
         "xai/grok-4-0709",
-        "openai/gpt-5.2", // Newer and cheaper input than gpt-4o
+        "openai/gpt-5.4", // Newest flagship, same price as 4o
         "openai/gpt-4o",
         "anthropic/claude-sonnet-4.6",
       ],
@@ -1107,7 +1107,7 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
       fallback: [
         "anthropic/claude-haiku-4.5",
         "google/gemini-2.5-flash-lite",
-        "xai/grok-code-fast-1",
+        "deepseek/deepseek-chat",
       ],
     },
     MEDIUM: {
@@ -1122,10 +1122,11 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
     COMPLEX: {
       primary: "anthropic/claude-opus-4.6", // Best quality for complex tasks
       fallback: [
+        "openai/gpt-5.4", // Newest flagship
         "openai/gpt-5.2-codex",
         "anthropic/claude-opus-4.6",
         "anthropic/claude-sonnet-4.6",
-        "google/gemini-3.1-pro-preview", // Newest Gemini
+        "google/gemini-3.1-pro", // Newest Gemini
         "google/gemini-3-pro-preview",
         "moonshot/kimi-k2.5",
       ],
@@ -1153,15 +1154,19 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
       ],
     },
     MEDIUM: {
-      primary: "xai/grok-code-fast-1", // Code specialist for agentic coding
-      fallback: ["moonshot/kimi-k2.5", "anthropic/claude-haiku-4.5", "claude-sonnet-4"],
+      primary: "moonshot/kimi-k2.5", // $0.50/$2.40 - strong tool use, handles function calls correctly
+      fallback: [
+        "anthropic/claude-haiku-4.5",
+        "deepseek/deepseek-chat",
+        "xai/grok-4-1-fast-non-reasoning",
+      ],
     },
     COMPLEX: {
       primary: "anthropic/claude-sonnet-4.6",
       fallback: [
         "anthropic/claude-opus-4.6", // Latest Opus - best agentic
-        "openai/gpt-5.2",
-        "google/gemini-3.1-pro-preview", // Newest Gemini
+        "openai/gpt-5.4", // Newest flagship
+        "google/gemini-3.1-pro", // Newest Gemini
         "google/gemini-3-pro-preview",
         "xai/grok-4-0709",
       ],

@@ -203,8 +203,8 @@ if [ ! -f "$DIST_PATH" ]; then
 fi
 echo "  ✓ dist/index.js verified"
 
-# 6.2. Refresh blockrun model catalog from installed package
-echo "→ Refreshing BlockRun models catalog..."
+# 6.2. Populate model allowlist so top BlockRun models appear in /model picker
+echo "→ Populating model allowlist..."
 node -e "
 const os = require('os');
 const fs = require('fs');
@@ -220,62 +220,63 @@ try {
   const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   let changed = false;
 
-  // Ensure provider exists
+  // Ensure provider exists with apiKey
   if (!config.models) config.models = {};
   if (!config.models.providers) config.models.providers = {};
   if (!config.models.providers.blockrun) {
     config.models.providers.blockrun = { api: 'openai-completions', models: [] };
     changed = true;
   }
-
-  const blockrun = config.models.providers.blockrun;
-  if (!blockrun.apiKey) {
-    blockrun.apiKey = 'x402-proxy-handles-auth';
-    changed = true;
-  }
-  if (!Array.isArray(blockrun.models)) {
-    blockrun.models = [];
+  if (!config.models.providers.blockrun.apiKey) {
+    config.models.providers.blockrun.apiKey = 'x402-proxy-handles-auth';
     changed = true;
   }
 
-  // Ensure minimax model exists in provider catalog
-  const hasMiniMaxModel = blockrun.models.some(m => m && m.id === 'minimax/minimax-m2.5');
-  if (!hasMiniMaxModel) {
-    blockrun.models.push({
-      id: 'minimax/minimax-m2.5',
-      name: 'MiniMax M2.5',
-      api: 'openai-completions',
-      reasoning: true,
-      input: ['text'],
-      cost: { input: 0.3, output: 1.2, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 204800,
-      maxTokens: 16384
-    });
-    changed = true;
-    console.log('  Added minimax model to blockrun provider catalog');
-  }
+  // Top 16 models for the /model picker
+  const TOP_MODELS = [
+    'auto', 'free', 'eco', 'premium',
+    'anthropic/claude-sonnet-4.6', 'anthropic/claude-opus-4.6', 'anthropic/claude-haiku-4.5',
+    'openai/gpt-5.4', 'openai/gpt-4o', 'openai/o3',
+    'google/gemini-3.1-pro', 'google/gemini-3-flash-preview',
+    'deepseek/deepseek-chat', 'moonshot/kimi-k2.5',
+    'xai/grok-3', 'minimax/minimax-m2.5'
+  ];
 
-  // Ensure minimax alias is present in model picker allowlist
   if (!config.agents) config.agents = {};
   if (!config.agents.defaults) config.agents.defaults = {};
   if (!config.agents.defaults.models || typeof config.agents.defaults.models !== 'object') {
     config.agents.defaults.models = {};
     changed = true;
   }
-  const allowlist = config.agents.defaults.models;
-  if (!allowlist['blockrun/minimax'] || allowlist['blockrun/minimax'].alias !== 'minimax') {
-    allowlist['blockrun/minimax'] = { alias: 'minimax' };
-    changed = true;
-    console.log('  Added minimax to model picker allowlist');
-  }
 
+  const allowlist = config.agents.defaults.models;
+  // Clean out old blockrun entries not in TOP_MODELS
+  const topSet = new Set(TOP_MODELS.map(id => 'blockrun/' + id));
+  for (const key of Object.keys(allowlist)) {
+    if (key.startsWith('blockrun/') && !topSet.has(key)) {
+      delete allowlist[key];
+      changed = true;
+    }
+  }
+  let added = 0;
+  for (const id of TOP_MODELS) {
+    const key = 'blockrun/' + id;
+    if (!allowlist[key]) {
+      allowlist[key] = {};
+      added++;
+    }
+  }
+  if (added > 0) {
+    changed = true;
+    console.log('  Added ' + added + ' models to allowlist (' + TOP_MODELS.length + ' total)');
+  } else {
+    console.log('  Allowlist already up to date');
+  }
   if (changed) {
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-  } else {
-    console.log('  blockrun minimax config already up to date');
   }
 } catch (err) {
-  console.log('  Could not update minimax config:', err.message);
+  console.log('  Could not update config:', err.message);
 }
 "
 
@@ -347,5 +348,16 @@ echo "  /model codex     → openai/gpt-5.2-codex"
 echo "  /model deepseek  → deepseek/deepseek-chat"
 echo "  /model minimax   → minimax/minimax-m2.5"
 echo "  /model free      → gpt-oss-120b (FREE)"
+echo ""
+echo "Image generation:"
+echo "  /imagegen <prompt>                           # default: nano-banana"
+echo "  /imagegen --model dall-e-3 <prompt>          # DALL-E 3"
+echo "  /imagegen --model gpt-image <prompt>         # GPT Image 1"
+echo ""
+echo "CLI commands:"
+echo "  npx @blockrun/clawrouter report            # daily usage report"
+echo "  npx @blockrun/clawrouter report weekly      # weekly report"
+echo "  npx @blockrun/clawrouter report monthly     # monthly report"
+echo "  npx @blockrun/clawrouter doctor             # AI diagnostics"
 echo ""
 echo "To uninstall: bash ~/.openclaw/extensions/clawrouter/scripts/uninstall.sh"

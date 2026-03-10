@@ -43,7 +43,9 @@ export const MODEL_ALIASES: Record<string, string> = {
   // OpenAI
   gpt: "openai/gpt-4o",
   gpt4: "openai/gpt-4o",
-  gpt5: "openai/gpt-5.2",
+  gpt5: "openai/gpt-5.4",
+  "gpt-5.4": "openai/gpt-5.4",
+  "gpt-5.4-pro": "openai/gpt-5.4-pro",
   codex: "openai/gpt-5.2-codex",
   mini: "openai/gpt-4o-mini",
   o1: "openai/o1",
@@ -61,6 +63,8 @@ export const MODEL_ALIASES: Record<string, string> = {
   // Google
   gemini: "google/gemini-2.5-pro",
   flash: "google/gemini-2.5-flash",
+  "gemini-3.1-pro-preview": "google/gemini-3.1-pro",
+  "google/gemini-3.1-pro-preview": "google/gemini-3.1-pro",
 
   // xAI
   grok: "xai/grok-3",
@@ -123,6 +127,13 @@ type BlockRunModel = {
   vision?: boolean;
   /** Models optimized for agentic workflows (multi-step autonomous tasks) */
   agentic?: boolean;
+  /**
+   * Model supports OpenAI-compatible structured function/tool calling.
+   * Models without this flag output tool invocations as plain text JSON,
+   * which leaks raw {"command":"..."} into visible chat messages.
+   * Default: false (must opt-in to prevent silent regressions on new models).
+   */
+  toolCalling?: boolean;
 };
 
 export const BLOCKRUN_MODELS: BlockRunModel[] = [
@@ -173,6 +184,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     reasoning: true,
     vision: true,
     agentic: true,
+    toolCalling: true,
   },
   {
     id: "openai/gpt-5-mini",
@@ -182,6 +194,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 2.0,
     contextWindow: 200000,
     maxOutput: 65536,
+    toolCalling: true,
   },
   {
     id: "openai/gpt-5-nano",
@@ -191,6 +204,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 0.4,
     contextWindow: 128000,
     maxOutput: 32768,
+    toolCalling: true,
   },
   {
     id: "openai/gpt-5.2-pro",
@@ -201,6 +215,32 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 400000,
     maxOutput: 128000,
     reasoning: true,
+    toolCalling: true,
+  },
+  // GPT-5.4 — newest flagship, same input price as 4o but much more capable
+  {
+    id: "openai/gpt-5.4",
+    name: "GPT-5.4",
+    version: "5.4",
+    inputPrice: 2.5,
+    outputPrice: 15.0,
+    contextWindow: 400000,
+    maxOutput: 128000,
+    reasoning: true,
+    vision: true,
+    agentic: true,
+    toolCalling: true,
+  },
+  {
+    id: "openai/gpt-5.4-pro",
+    name: "GPT-5.4 Pro",
+    version: "5.4",
+    inputPrice: 30.0,
+    outputPrice: 180.0,
+    contextWindow: 400000,
+    maxOutput: 128000,
+    reasoning: true,
+    toolCalling: true,
   },
 
   // OpenAI Codex Family
@@ -213,6 +253,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 128000,
     maxOutput: 32000,
     agentic: true,
+    toolCalling: true,
   },
 
   // OpenAI GPT-4 Family
@@ -225,6 +266,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 128000,
     maxOutput: 16384,
     vision: true,
+    toolCalling: true,
   },
   {
     id: "openai/gpt-4.1-mini",
@@ -234,6 +276,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 1.6,
     contextWindow: 128000,
     maxOutput: 16384,
+    toolCalling: true,
   },
   {
     id: "openai/gpt-4.1-nano",
@@ -243,6 +286,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 0.4,
     contextWindow: 128000,
     maxOutput: 16384,
+    toolCalling: true,
   },
   {
     id: "openai/gpt-4o",
@@ -254,6 +298,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     maxOutput: 16384,
     vision: true,
     agentic: true,
+    toolCalling: true,
   },
   {
     id: "openai/gpt-4o-mini",
@@ -263,6 +308,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 0.6,
     contextWindow: 128000,
     maxOutput: 16384,
+    toolCalling: true,
   },
 
   // OpenAI O-series (Reasoning)
@@ -275,6 +321,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 200000,
     maxOutput: 100000,
     reasoning: true,
+    toolCalling: true,
   },
   {
     id: "openai/o1-mini",
@@ -285,6 +332,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 128000,
     maxOutput: 65536,
     reasoning: true,
+    toolCalling: true,
   },
   {
     id: "openai/o3",
@@ -295,6 +343,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 200000,
     maxOutput: 100000,
     reasoning: true,
+    toolCalling: true,
   },
   {
     id: "openai/o3-mini",
@@ -305,6 +354,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 128000,
     maxOutput: 65536,
     reasoning: true,
+    toolCalling: true,
   },
   {
     id: "openai/o4-mini",
@@ -315,6 +365,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 128000,
     maxOutput: 65536,
     reasoning: true,
+    toolCalling: true,
   },
 
   // Anthropic - all Claude models excel at agentic workflows
@@ -327,7 +378,9 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 5.0,
     contextWindow: 200000,
     maxOutput: 8192,
+    vision: true,
     agentic: true,
+    toolCalling: true,
   },
   {
     id: "anthropic/claude-sonnet-4.6",
@@ -338,7 +391,9 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 200000,
     maxOutput: 64000,
     reasoning: true,
+    vision: true,
     agentic: true,
+    toolCalling: true,
   },
   {
     id: "anthropic/claude-opus-4.6",
@@ -349,13 +404,15 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 200000,
     maxOutput: 32000,
     reasoning: true,
+    vision: true,
     agentic: true,
+    toolCalling: true,
   },
 
   // Google
   {
-    id: "google/gemini-3.1-pro-preview",
-    name: "Gemini 3.1 Pro Preview",
+    id: "google/gemini-3.1-pro",
+    name: "Gemini 3.1 Pro",
     version: "3.1",
     inputPrice: 2.0,
     outputPrice: 12.0,
@@ -363,6 +420,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     maxOutput: 65536,
     reasoning: true,
     vision: true,
+    toolCalling: true,
   },
   {
     id: "google/gemini-3-pro-preview",
@@ -374,6 +432,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     maxOutput: 65536,
     reasoning: true,
     vision: true,
+    toolCalling: true,
   },
   {
     id: "google/gemini-3-flash-preview",
@@ -395,6 +454,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     maxOutput: 65536,
     reasoning: true,
     vision: true,
+    toolCalling: true,
   },
   {
     id: "google/gemini-2.5-flash",
@@ -404,6 +464,8 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 2.5,
     contextWindow: 1000000,
     maxOutput: 65536,
+    vision: true,
+    toolCalling: true,
   },
   {
     id: "google/gemini-2.5-flash-lite",
@@ -413,6 +475,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 0.4,
     contextWindow: 1000000,
     maxOutput: 65536,
+    toolCalling: true,
   },
 
   // DeepSeek
@@ -424,6 +487,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 0.42,
     contextWindow: 128000,
     maxOutput: 8192,
+    toolCalling: true,
   },
   {
     id: "deepseek/deepseek-reasoner",
@@ -434,6 +498,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 128000,
     maxOutput: 8192,
     reasoning: true,
+    toolCalling: true,
   },
 
   // Moonshot / Kimi - optimized for agentic workflows
@@ -448,6 +513,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     reasoning: true,
     vision: true,
     agentic: true,
+    toolCalling: true,
   },
 
   // xAI / Grok
@@ -460,6 +526,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 131072,
     maxOutput: 16384,
     reasoning: true,
+    toolCalling: true,
   },
   // grok-3-fast removed - too expensive ($5/$25), use grok-4-fast instead
   {
@@ -470,6 +537,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 0.5,
     contextWindow: 131072,
     maxOutput: 16384,
+    toolCalling: true,
   },
 
   // xAI Grok 4 Family - Ultra-cheap fast models
@@ -482,6 +550,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 131072,
     maxOutput: 16384,
     reasoning: true,
+    toolCalling: true,
   },
   {
     id: "xai/grok-4-fast-non-reasoning",
@@ -491,6 +560,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 0.5,
     contextWindow: 131072,
     maxOutput: 16384,
+    toolCalling: true,
   },
   {
     id: "xai/grok-4-1-fast-reasoning",
@@ -501,6 +571,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 131072,
     maxOutput: 16384,
     reasoning: true,
+    toolCalling: true,
   },
   {
     id: "xai/grok-4-1-fast-non-reasoning",
@@ -510,6 +581,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 0.5,
     contextWindow: 131072,
     maxOutput: 16384,
+    toolCalling: true,
   },
   {
     id: "xai/grok-code-fast-1",
@@ -519,7 +591,9 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 1.5,
     contextWindow: 131072,
     maxOutput: 16384,
-    agentic: true, // Good for coding tasks
+    // toolCalling intentionally omitted: outputs tool calls as plain text JSON,
+    // not OpenAI-compatible structured function calls. Will be skipped when
+    // request has tools to prevent the "talking to itself" bug.
   },
   {
     id: "xai/grok-4-0709",
@@ -530,6 +604,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 131072,
     maxOutput: 16384,
     reasoning: true,
+    toolCalling: true,
   },
   {
     id: "xai/grok-2-vision",
@@ -540,6 +615,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 131072,
     maxOutput: 16384,
     vision: true,
+    toolCalling: true,
   },
 
   // MiniMax
@@ -553,6 +629,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     maxOutput: 16384,
     reasoning: true,
     agentic: true,
+    toolCalling: true,
   },
 
   // NVIDIA - Free/cheap models
@@ -564,6 +641,8 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 0,
     contextWindow: 128000,
     maxOutput: 16384,
+    // toolCalling intentionally omitted: free model, structured function
+    // calling support unverified. Excluded from tool-heavy routing paths.
   },
   {
     id: "nvidia/kimi-k2.5",
@@ -573,6 +652,7 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     outputPrice: 2.5,
     contextWindow: 262144,
     maxOutput: 16384,
+    toolCalling: true,
   },
 ];
 
@@ -647,6 +727,27 @@ export function isAgenticModel(modelId: string): boolean {
  */
 export function getAgenticModels(): string[] {
   return BLOCKRUN_MODELS.filter((m) => m.agentic).map((m) => m.id);
+}
+
+/**
+ * Check if a model supports OpenAI-compatible structured tool/function calling.
+ * Models without this flag (e.g. grok-code-fast-1) output tool invocations as
+ * plain text JSON, which leaks {"command":"..."} into visible chat messages.
+ */
+export function supportsToolCalling(modelId: string): boolean {
+  const normalized = modelId.replace("blockrun/", "");
+  const model = BLOCKRUN_MODELS.find((m) => m.id === normalized);
+  return model?.toolCalling ?? false;
+}
+
+/**
+ * Check if a model supports vision (image inputs).
+ * Models without this flag cannot process image_url content parts.
+ */
+export function supportsVision(modelId: string): boolean {
+  const normalized = modelId.replace("blockrun/", "");
+  const model = BLOCKRUN_MODELS.find((m) => m.id === normalized);
+  return model?.vision ?? false;
 }
 
 /**

@@ -15,6 +15,7 @@ import type { AddressInfo } from "node:net";
 const modelCalls: string[] = [];
 let failModels: string[] = [];
 let failAllModels = false;
+let failMode: "json" | "sse" | "json200" = "json";
 
 // Mock BlockRun API server
 async function startMockServer(): Promise<{ port: number; close: () => Promise<void> }> {
@@ -34,6 +35,33 @@ async function startMockServer(): Promise<{ port: number; close: () => Promise<v
 
       // Simulate provider error for models in failModels list (or all models)
       if (failAllModels || failModels.includes(model)) {
+        if (failMode === "sse") {
+          console.log(`  [MockAPI] Simulating 200 SSE provider error for ${model}`);
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          const limitMsg = "Provider error: service currently unavailable";
+          res.end([
+            `data: ${JSON.stringify({ is_error: true, result: limitMsg, type: "result", subtype: "success" })}`,
+            "",
+            "data: [DONE]",
+            "",
+          ].join("\n"));
+          return;
+        }
+
+        if (failMode === "json200") {
+          console.log(`  [MockAPI] Simulating 200 JSON provider error for ${model}`);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              is_error: true,
+              result: "Provider error: service currently unavailable",
+              type: "result",
+              subtype: "success",
+            }),
+          );
+          return;
+        }
+
         console.log(`  [MockAPI] Simulating billing error for ${model}`);
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(
@@ -110,7 +138,7 @@ async function runTests() {
 
   // Start ClawRouter proxy pointing to mock API
   const proxy = await startProxy({
-    walletKey: testWalletKey,
+    wallet: testWalletKey,
     apiBase: `http://127.0.0.1:${mockApi.port}`,
     port: 0,
     skipBalanceCheck: true, // Skip balance check for testing
@@ -129,6 +157,7 @@ async function runTests() {
     modelCalls.length = 0;
     failModels = [];
     failAllModels = false;
+    failMode = "json";
 
     const res = await fetch(`${proxy.baseUrl}/v1/chat/completions`, {
       method: "POST",
@@ -154,6 +183,7 @@ async function runTests() {
     modelCalls.length = 0;
     failModels = [];
     failAllModels = false;
+    failMode = "json";
 
     const res = await fetch(`${proxy.baseUrl}/v1/chat/completions`, {
       method: "POST",
@@ -175,6 +205,7 @@ async function runTests() {
     modelCalls.length = 0;
     failModels = [reasoningPrimary];
     failAllModels = false;
+    failMode = "json";
 
     const res = await fetch(`${proxy.baseUrl}/v1/chat/completions`, {
       method: "POST",
@@ -199,6 +230,66 @@ async function runTests() {
     reasoningFirstFallback = modelCalls[1] || "";
   }
 
+  // Test 2c: Primary returns 200 SSE limit payload - should fallback
+  {
+    console.log("\n--- Test 2c: Primary 200 SSE limit payload fallback succeeds ---");
+    modelCalls.length = 0;
+    failModels = [reasoningPrimary];
+    failAllModels = false;
+    failMode = "sse";
+
+    const res = await fetch(`${proxy.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "auto",
+        messages: [{ role: "user", content: reasoningPrompt() }],
+        max_tokens: 50,
+      }),
+    });
+
+    assert(res.ok, `Response OK after 200 SSE fallback: ${res.status}`);
+    const data = (await res.json()) as {
+      model?: string;
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const content = data.choices?.[0]?.message?.content || "";
+    assert(content.startsWith("Response from "), `Response from fallback model: ${content}`);
+    assert(modelCalls.length >= 2, `At least 2 models called: ${modelCalls.join(", ")}`);
+    assert(modelCalls[0] === reasoningPrimary, `First tried primary: ${modelCalls[0]}`);
+    assert(modelCalls[1] !== reasoningPrimary, `Then tried fallback: ${modelCalls[1]}`);
+  }
+
+  // Test 2b: Primary returns 200 JSON limit payload - should fallback
+  {
+    console.log("\n--- Test 2b: Primary 200 JSON limit payload fallback succeeds ---");
+    modelCalls.length = 0;
+    failModels = [reasoningPrimary];
+    failAllModels = false;
+    failMode = "json200";
+
+    const res = await fetch(`${proxy.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "auto",
+        messages: [{ role: "user", content: reasoningPrompt() }],
+        max_tokens: 50,
+      }),
+    });
+
+    assert(res.ok, `Response OK after 200 JSON fallback: ${res.status}`);
+    const data = (await res.json()) as {
+      model?: string;
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const content = data.choices?.[0]?.message?.content || "";
+    assert(content.startsWith("Response from "), `Response from fallback model: ${content}`);
+    assert(modelCalls.length >= 2, `At least 2 models called: ${modelCalls.join(", ")}`);
+    assert(modelCalls[0] === reasoningPrimary, `First tried primary: ${modelCalls[0]}`);
+    assert(modelCalls[1] !== reasoningPrimary, `Then tried fallback: ${modelCalls[1]}`);
+  }
+
   // Test 3: Primary and first fallback fail - should try second fallback
   {
     console.log("\n--- Test 3: Primary + first fallback fail, second fallback succeeds ---");
@@ -208,6 +299,7 @@ async function runTests() {
       ? [reasoningPrimary, reasoningFirstFallback]
       : [reasoningPrimary];
     failAllModels = false;
+    failMode = "json";
 
     const res = await fetch(`${proxy.baseUrl}/v1/chat/completions`, {
       method: "POST",
@@ -232,6 +324,7 @@ async function runTests() {
     modelCalls.length = 0;
     failModels = [];
     failAllModels = true;
+    failMode = "json";
 
     const res = await fetch(`${proxy.baseUrl}/v1/chat/completions`, {
       method: "POST",
@@ -263,6 +356,7 @@ async function runTests() {
     modelCalls.length = 0;
     failModels = ["openai/gpt-4o"];
     failAllModels = false;
+    failMode = "json";
 
     const res = await fetch(`${proxy.baseUrl}/v1/chat/completions`, {
       method: "POST",
@@ -293,6 +387,7 @@ async function runTests() {
     modelCalls.length = 0;
     failModels = [];
     failAllModels = false;
+    failMode = "json";
 
     const res = await fetch(`${proxy.baseUrl}/v1/chat/completions`, {
       method: "POST",
@@ -318,6 +413,7 @@ async function runTests() {
     modelCalls.length = 0;
     failModels = ["deepseek/deepseek-chat"];
     failAllModels = false;
+    failMode = "json";
 
     const res = await fetch(`${proxy.baseUrl}/v1/chat/completions`, {
       method: "POST",
@@ -341,6 +437,36 @@ async function runTests() {
       `Primary canonical model used: ${modelCalls[0]}`,
     );
     assert(modelCalls[1] === "nvidia/gpt-oss-120b", `Fallback model used: ${modelCalls[1]}`);
+  }
+
+  // Test 8: Explicit model with 200 SSE provider error payload falls back to free model
+  {
+    console.log("\n--- Test 8: Explicit model 200 SSE fallback to free model ---");
+    modelCalls.length = 0;
+    failModels = ["openai/gpt-4o"];
+    failAllModels = false;
+    failMode = "sse";
+
+    const res = await fetch(`${proxy.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "openai/gpt-4o",
+        messages: [{ role: "user", content: uniqueMessage("Hello") }],
+        max_tokens: 50,
+      }),
+    });
+
+    assert(res.ok, `Explicit model 200 SSE fallback succeeds: ${res.status}`);
+    assert(
+      modelCalls.length === 2,
+      `2 models called (primary + free fallback): ${modelCalls.join(", ")}`,
+    );
+    assert(modelCalls[0] === "openai/gpt-4o", `Primary explicit model first: ${modelCalls[0]}`);
+    assert(
+      modelCalls[1] === "nvidia/gpt-oss-120b",
+      `Then fell back to free model: ${modelCalls[1]}`,
+    );
   }
 
   // Cleanup

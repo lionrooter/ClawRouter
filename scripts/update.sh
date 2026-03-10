@@ -69,6 +69,33 @@ kill_port_processes 8402
 echo "→ Removing old plugin files..."
 rm -rf ~/.openclaw/extensions/clawrouter
 
+# ── Step 3b: Clean stale plugin entry from config ─────────────
+# After deleting plugin files, openclaw's config validator rejects
+# the orphaned plugins.entries.clawrouter reference. Remove it so
+# the fresh install in Step 4 can proceed.
+echo "→ Cleaning config..."
+node -e "
+const fs = require('fs');
+const path = require('path');
+const configPath = path.join(require('os').homedir(), '.openclaw', 'openclaw.json');
+if (!fs.existsSync(configPath)) process.exit(0);
+try {
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  const entries = config?.plugins?.entries;
+  if (entries && entries.clawrouter) {
+    delete entries.clawrouter;
+    const tmp = configPath + '.tmp.' + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
+    fs.renameSync(tmp, configPath);
+    console.log('  Removed stale plugin entry');
+  } else {
+    console.log('  Config clean');
+  }
+} catch (err) {
+  console.log('  Skipped: ' + err.message);
+}
+"
+
 # ── Step 4: Install latest version ─────────────────────────────
 echo "→ Installing latest ClawRouter..."
 openclaw plugins install @blockrun/clawrouter
@@ -139,6 +166,70 @@ if (!store.profiles[profileKey]) {
 echo "→ Cleaning models cache..."
 rm -f ~/.openclaw/agents/*/agent/models.json 2>/dev/null || true
 
+# ── Step 8: Populate model allowlist with top 16 models ────────
+echo "→ Populating model allowlist..."
+node -e "
+const os = require('os');
+const fs = require('fs');
+const path = require('path');
+const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+
+if (!fs.existsSync(configPath)) {
+  console.log('  No config file found, skipping');
+  process.exit(0);
+}
+
+try {
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+
+  // Top 16 models for the /model picker
+  const TOP_MODELS = [
+    'auto', 'free', 'eco', 'premium',
+    'anthropic/claude-sonnet-4.6', 'anthropic/claude-opus-4.6', 'anthropic/claude-haiku-4.5',
+    'openai/gpt-5.4', 'openai/gpt-4o', 'openai/o3',
+    'google/gemini-3.1-pro', 'google/gemini-3-flash-preview',
+    'deepseek/deepseek-chat', 'moonshot/kimi-k2.5',
+    'xai/grok-3', 'minimax/minimax-m2.5'
+  ];
+
+  if (!config.agents) config.agents = {};
+  if (!config.agents.defaults) config.agents.defaults = {};
+  if (!config.agents.defaults.models || typeof config.agents.defaults.models !== 'object') {
+    config.agents.defaults.models = {};
+  }
+
+  const allowlist = config.agents.defaults.models;
+  // Clean out old blockrun entries not in TOP_MODELS
+  const topSet = new Set(TOP_MODELS.map(id => 'blockrun/' + id));
+  for (const key of Object.keys(allowlist)) {
+    if (key.startsWith('blockrun/') && !topSet.has(key)) {
+      delete allowlist[key];
+    }
+  }
+  let added = 0;
+  for (const id of TOP_MODELS) {
+    const key = 'blockrun/' + id;
+    if (!allowlist[key]) {
+      allowlist[key] = {};
+      added++;
+    }
+  }
+
+  // Atomic write
+  const tmpPath = configPath + '.tmp.' + process.pid;
+  fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2));
+  fs.renameSync(tmpPath, configPath);
+
+  if (added > 0) {
+    console.log('  Added ' + added + ' models to allowlist (' + TOP_MODELS.length + ' total)');
+  } else {
+    console.log('  Allowlist already up to date');
+  }
+} catch (err) {
+  console.log('  Migration skipped: ' + err.message);
+}
+"
+
 # ── Summary ─────────────────────────────────────────────────────
 echo ""
 echo "✓ ClawRouter updated successfully!"
@@ -163,6 +254,12 @@ fi
 
 echo ""
 echo "  Run: openclaw gateway restart"
+echo ""
+echo "  Commands:"
+echo "    npx @blockrun/clawrouter report            # daily usage report"
+echo "    npx @blockrun/clawrouter report weekly      # weekly report"
+echo "    npx @blockrun/clawrouter report monthly     # monthly report"
+echo "    npx @blockrun/clawrouter doctor             # AI diagnostics"
 echo ""
 echo "  ⚠  Back up your wallet key: /wallet export  (in OpenClaw)"
 echo ""

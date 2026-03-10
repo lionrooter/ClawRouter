@@ -1,28 +1,30 @@
 /**
- * Lionheart Custom Routing Config
+ * Lionheart Custom Routing Config — AlexFinn Three-Tier Strategy
  *
- * Local-first routing: uses free local models for simple/medium tasks,
- * Claude subscription for complex/reasoning, DeepSeek as cheap cloud fallback.
+ * Strategy (per @AlexFinn recommendation):
+ *   1. Opus as orchestrator — planning, reasoning, complex analysis
+ *   2. Codex GPT for coding — code generation, multi-step technical tasks
+ *   3. Qwen 3.5 small models for dirty work — heartbeat, organizing, summarizing (~70%)
  *
  * Backends (via CLI proxy at 127.0.0.1:11435):
- *   - EXO (localhost:52415)      → Llama 3.1 8B on Apple Silicon ($0)
- *   - Ollama (daddyo-gaming)     → Qwen3 14B on RTX 3080 ($0, native tool calling)
- *   - Claude CLI (subscription)  → Sonnet/Opus via `claude --print`
- *   - Codex CLI (subscription)   → GPT-5.3 Codex / o3 via `codex --full-auto`
- *   - DeepSeek API               → deepseek-chat / deepseek-reasoner (pay-per-token)
+ *   - Ollama (local, Apple Silicon) → Qwen3.5 4B/0.8B/9B ($0, native tool calling)
+ *   - Ollama (local)               → Qwen3 14B ($0, legacy workhorse)
+ *   - Claude CLI (subscription)    → Opus 4.6 orchestrator via `claude --print`
+ *   - Codex CLI (subscription)     → GPT-5.3 Codex / o3 via `codex --full-auto`
+ *   - DeepSeek API                 → deepseek-chat / deepseek-reasoner (pay-per-token)
  *
  * Fallback priority: local($0) → subscription($0 marginal) → cloud(per-token)
- * When hitting Claude weekly limits, Codex is tried before DeepSeek.
  *
  * Model ID convention (matches CLI proxy routing):
- *   local/exo-llama-8b       → EXO Llama 3.1 8B
- *   local/ollama-qwen3-14b   → Ollama Qwen3 14B (CUDA, tool calling)
- *   local/exo-llama-3b       → EXO Llama 3.2 3B (fast)
- *   claude-cli/sonnet         → Claude Sonnet 4.5 (subscription)
- *   claude-cli/opus           → Claude Opus 4.6 (subscription)
- *   codex/gpt-5.3             → GPT-5.3 Codex (subscription, code specialist)
- *   codex/o3                  → OpenAI o3 (subscription, reasoning specialist)
- *   deepseek/deepseek-chat    → DeepSeek V3 ($0.14/$0.28 per M tokens)
+ *   local/ollama-qwen3.5-4b   → Qwen3.5 4B (3.4GB, fast, tool calling) — SIMPLE primary
+ *   local/ollama-qwen3.5-0.8b → Qwen3.5 0.8B (1.0GB, ultra-fast) — heartbeat/yes-no
+ *   local/ollama-qwen3.5-9b   → Qwen3.5 9B (6.6GB, stronger) — agentic medium
+ *   local/ollama-qwen3-14b    → Qwen3 14B (legacy, tool calling)
+ *   claude-cli/opus            → Claude Opus 4.6 (subscription) — orchestrator
+ *   claude-cli/sonnet          → Claude Sonnet 4.5 (subscription) — fallback
+ *   codex/gpt-5.3              → GPT-5.3 Codex (subscription, code specialist)
+ *   codex/o3                   → OpenAI o3 (subscription, reasoning specialist)
+ *   deepseek/deepseek-chat     → DeepSeek V3 ($0.14/$0.28 per M tokens)
  *   deepseek/deepseek-reasoner → DeepSeek R1 ($0.55/$2.19 per M tokens)
  */
 
@@ -33,65 +35,60 @@ export const LIONHEART_ROUTING_CONFIG: RoutingConfig = {
   ...DEFAULT_ROUTING_CONFIG,
 
   tiers: {
-    // SIMPLE: greetings, definitions, translations, yes/no questions
-    // → Free local model, fast response, no quota burn
+    // SIMPLE: greetings, definitions, translations, yes/no, heartbeat, summaries
+    // → Qwen 3.5 4B: fast, tool calling, $0 (3.4GB sweet spot)
     SIMPLE: {
-      primary: "local/exo-llama-8b",
+      primary: "local/ollama-qwen3.5-4b",
       fallback: [
-        "local/ollama-qwen3-14b",  // $0 local
-        "claude-cli/sonnet",       // subscription
-        "deepseek/deepseek-chat",  // $0.14/M (last resort)
+        "local/ollama-qwen3.5-0.8b",  // $0 ultra-fast fallback
+        "deepseek/deepseek-chat",      // $0.14/M (last resort)
       ],
     },
 
     // MEDIUM: code tasks, technical questions, multi-step instructions
-    // → Ollama Qwen3 14B handles this well with native tool calling
+    // → Codex GPT for coding
     MEDIUM: {
-      primary: "local/ollama-qwen3-14b",
+      primary: "codex/gpt-5.3",
       fallback: [
-        "codex/gpt-5.3",          // subscription, code specialist
-        "claude-cli/sonnet",       // subscription
-        "deepseek/deepseek-chat",  // $0.14/M
+        "claude-cli/sonnet",           // subscription fallback
+        "local/ollama-qwen3-14b",      // $0 local
+        "deepseek/deepseek-chat",      // $0.14/M
       ],
     },
 
-    // COMPLEX: architecture design, complex analysis, long-context tasks
-    // → Claude Sonnet first, then Codex (subscription) before DeepSeek (paid)
+    // COMPLEX: architecture design, complex analysis, planning, orchestration
+    // → Opus as orchestrator
     COMPLEX: {
-      primary: "claude-cli/sonnet",
+      primary: "claude-cli/opus",
       fallback: [
-        "codex/gpt-5.3",              // subscription — tried before DeepSeek
-        "claude-cli/opus",             // subscription escalation
+        "codex/gpt-5.3",              // subscription — code fallback
+        "claude-cli/sonnet",           // subscription downgrade
         "deepseek/deepseek-chat",      // $0.14/M
       ],
     },
 
     // REASONING: proofs, formal derivation, chain-of-thought, math
-    // → Claude Opus first, then Codex o3 (subscription reasoning) before DeepSeek
     REASONING: {
       primary: "claude-cli/opus",
       fallback: [
         "codex/o3",                    // subscription — OpenAI reasoning model
         "deepseek/deepseek-reasoner",  // $0.55/M
-        "claude-cli/sonnet",           // subscription downgrade
       ],
     },
   },
 
   // Agentic tiers: models with strong tool calling for multi-step tasks
-  // Key: Ollama Qwen3 14B has native OpenAI tool calling (0.971 F1)
-  // Codex GPT-5.3 also supports tool calling via <<<TOOL_CALL>>> protocol
+  // Key: Qwen3.5 has native OpenAI-compatible tool calling
   agenticTiers: {
     SIMPLE: {
-      primary: "local/ollama-qwen3-14b",  // Native tool calling, $0
+      primary: "local/ollama-qwen3.5-4b",  // Native tool calling, $0
       fallback: [
-        "codex/gpt-5.3",              // subscription, tool calling
-        "claude-cli/sonnet",           // subscription
+        "local/ollama-qwen3.5-9b",    // $0 stronger fallback
         "deepseek/deepseek-chat",      // $0.14/M
       ],
     },
     MEDIUM: {
-      primary: "local/ollama-qwen3-14b",  // Strong tool calling for coding
+      primary: "local/ollama-qwen3.5-9b",  // 9B for agentic medium, tool calling
       fallback: [
         "codex/gpt-5.3",              // subscription, code specialist
         "claude-cli/sonnet",           // subscription
@@ -99,10 +96,10 @@ export const LIONHEART_ROUTING_CONFIG: RoutingConfig = {
       ],
     },
     COMPLEX: {
-      primary: "claude-cli/sonnet",
+      primary: "claude-cli/opus",
       fallback: [
-        "codex/gpt-5.3",              // subscription — before DeepSeek
-        "claude-cli/opus",             // subscription escalation
+        "codex/gpt-5.3",              // subscription — code fallback
+        "claude-cli/sonnet",           // subscription downgrade
         "deepseek/deepseek-chat",      // $0.14/M
       ],
     },
@@ -111,8 +108,16 @@ export const LIONHEART_ROUTING_CONFIG: RoutingConfig = {
       fallback: [
         "codex/o3",                    // subscription — reasoning specialist
         "deepseek/deepseek-reasoner",  // $0.55/M
-        "claude-cli/sonnet",           // subscription downgrade
       ],
+    },
+  },
+
+  scoring: {
+    ...DEFAULT_ROUTING_CONFIG.scoring,
+    tierBoundaries: {
+      simpleMedium: 0.0,       // Default — negative scores → SIMPLE, near-zero → ambiguous
+      mediumComplex: 0.30,     // Unchanged
+      complexReasoning: 0.50,  // Unchanged
     },
   },
 
@@ -120,8 +125,8 @@ export const LIONHEART_ROUTING_CONFIG: RoutingConfig = {
     ...DEFAULT_ROUTING_CONFIG.overrides,
     // Lower threshold since local models have small context windows
     maxTokensForceComplex: 8_000,
-    // Default ambiguous to MEDIUM (routes to Ollama, free)
-    ambiguousDefaultTier: "MEDIUM",
+    // Default ambiguous to SIMPLE (routes to Qwen, free)
+    ambiguousDefaultTier: "SIMPLE",
   },
 };
 
@@ -132,9 +137,12 @@ export const LIONHEART_ROUTING_CONFIG: RoutingConfig = {
  */
 export const LIONHEART_MODEL_PRICING = new Map([
   // Local models — $0
+  ["local/ollama-qwen3.5-4b", { inputPrice: 0, outputPrice: 0 }],
+  ["local/ollama-qwen3.5-0.8b", { inputPrice: 0, outputPrice: 0 }],
+  ["local/ollama-qwen3.5-9b", { inputPrice: 0, outputPrice: 0 }],
+  ["local/ollama-qwen3-14b", { inputPrice: 0, outputPrice: 0 }],
   ["local/exo-llama-8b", { inputPrice: 0, outputPrice: 0 }],
   ["local/exo-llama-3b", { inputPrice: 0, outputPrice: 0 }],
-  ["local/ollama-qwen3-14b", { inputPrice: 0, outputPrice: 0 }],
 
   // Claude CLI — subscription, no marginal cost per token
   ["claude-cli/sonnet", { inputPrice: 0, outputPrice: 0 }],
