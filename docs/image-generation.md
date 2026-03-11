@@ -1,3 +1,10 @@
+---
+summary: "Image generation support in ClawRouter, including models, pricing, and API usage"
+read_when:
+  - "working on image generation support or documentation"
+  - "checking image model options, sizes, or pricing"
+---
+
 # Image Generation
 
 Generate images via BlockRun's image API with x402 micropayments — no API keys, pay per image.

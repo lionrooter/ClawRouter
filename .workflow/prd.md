@@ -1,26 +1,26 @@
-# PRD — Normalize Lionroot ClawRouter Fork
+# PRD — Shared Multi-Tool Context Adapters for ClawRouter
 
 **Status:** Approved
-**Date:** 2026-03-10
+**Date:** 2026-03-11
+**Provenance:** See `.workflow/inputs/`
 
 ## Summary
-Move the real Lionroot ClawRouter fork state back onto fork `main`, preserve the current Lionroot-specific local changes, and merge the latest upstream ClawRouter updates without losing Lionroot behavior.
+Give ClawRouter the same shared AI-context structure already added in sibling Lionroot repos so Claude, Codex, Gemini, and local LLM workflows all start from the same neutral project docs instead of duplicated root-file prompts.
 
-## Current Lionroot-owned changes to preserve
-- Local CLI proxy dispatch for routed `local/*`, `ollama/*`, `claude-cli/*`, `codex/*`, and related local-backed model families.
-- Local memory-agent command/tool integration in the OpenClaw plugin entrypoint.
-- Existing Lionroot routing config and fallback-chain behavior already present on the sync branch.
+## User Stories
+- As an engineer using Codex, I want `AGENTS.md` to stay thin and point into durable docs so repo context does not drift.
+- As an engineer using Claude or Gemini, I want matching root adapters and a neutral `docs/project-context.md` entry point so the same repo knowledge works across tools.
+- As an operator syncing this fork with upstream, I want the new docs/adapters recorded in `LIONROOT-PATCHES.md` so they survive future merges.
 
 ## Acceptance Criteria
-- [x] Workflow docs are approved for this sync task.
-- [ ] In-flight local changes in `src/proxy.ts`, `src/index.ts`, and `src/proxy.local-dispatch.test.ts` are committed.
-- [ ] Lionroot patch inventory is documented for future syncs.
-- [ ] Fork `main` becomes the canonical deployable branch for Lionroot ClawRouter.
-- [ ] Latest `upstream/main` is merged into fork `main`.
-- [ ] Lionroot local-proxy dispatch and memory-agent behavior remain intact after the merge.
-- [ ] Targeted tests pass, followed by repo verification.
+- [x] Add `docs/project-context.md` with front matter and shared ClawRouter context.
+- [x] Replace monolithic root adapters with thin `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` files.
+- [x] Convert `CLAUDE.md` from a symlink into a normal adapter file.
+- [x] Add `summary` and `read_when` front matter to the existing durable docs in `docs/`.
+- [x] Update `LIONROOT-PATCHES.md` so the new adapter/doc surfaces are preserved across upstream syncs.
+- [x] Validate with `docs-list --path ./docs` and `git diff --check`.
 
 ## Out of Scope
-- Rewriting ClawRouter’s scoring strategy.
-- Reworking unrelated payment-chain internals beyond what upstream merge requires.
-- Refactoring the CLI proxy contract itself.
+- Any routing, inference, payment, or runtime behavior changes.
+- Rewriting ClawRouter architecture docs beyond adding front matter.
+- Packaging or publish changes.

@@ -1,3 +1,10 @@
+---
+summary: "Guide to using subscription-backed providers with ClawRouter failover semantics"
+read_when:
+  - "evaluating subscription-backed routing or failover policy"
+  - "documenting how ClawRouter interacts with user-owned subscriptions"
+---
+
 # Using Subscriptions with ClawRouter Failover
 
 This guide explains how to use your existing LLM subscriptions (Claude Pro/Max, ChatGPT Plus, etc.) as primary providers, with ClawRouter x402 micropayments as automatic failover.

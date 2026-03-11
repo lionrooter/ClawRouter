@@ -1,3 +1,10 @@
+---
+summary: "Historical design record for ClawRouter client-side smart routing and weighted scoring"
+read_when:
+  - "understanding why ClawRouter uses client-side routing and weighted scoring"
+  - "reviewing the original smart-routing design decisions"
+---
+
 # ClawRouter: Client-Side Smart Routing Design
 
 > **Status: Implemented (v2)** — Weighted scoring engine shipped in [`src/router/`](../../src/router/). This document is the design record.

@@ -1,6 +1,6 @@
-# CLAUDE.md — ClawRouter
+# GEMINI.md — ClawRouter
 
-Repo boot instructions for Claude Code. Treat this file as a thin adapter into the shared docs.
+Repo boot instructions for Gemini workflows. Treat this file as a thin adapter into the shared docs.
 
 ## Start Here
 
@@ -24,8 +24,7 @@ Key starting points:
 - `docs/troubleshooting.md`
 - `LIONROOT-PATCHES.md`
 
-## Claude-Specific Notes
+## Gemini-Specific Notes
 
-- Keep `CLAUDE.md` concise; durable detail belongs in `docs/`.
-- Use plan mode and RepoPrompt for non-trivial work.
-- For local or generic LLM consumers, the neutral starting point is `docs/project-context.md`.
+- Keep `GEMINI.md` concise; durable detail belongs in `docs/`.
+- If your Gemini workflow does not auto-load root files, start with `docs/project-context.md`.

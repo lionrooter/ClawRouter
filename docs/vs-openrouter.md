@@ -1,3 +1,10 @@
+---
+summary: "Comparison between ClawRouter and OpenRouter for agent-native routing"
+read_when:
+  - "explaining product positioning or architectural tradeoffs"
+  - "comparing ClawRouter to hosted routing alternatives"
+---
+
 # ClawRouter vs OpenRouter
 
 OpenRouter is a popular LLM routing service. Here's why ClawRouter is built differently — and why it matters for agents.

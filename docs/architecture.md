@@ -1,3 +1,10 @@
+---
+summary: "ClawRouter classification architecture, request flow, and internal routing design"
+read_when:
+  - "understanding how prompt classification and routing work"
+  - "modifying the router engine, scorer, or plugin integration"
+---
+
 # Architecture
 
 Technical deep-dive into ClawRouter's internals.

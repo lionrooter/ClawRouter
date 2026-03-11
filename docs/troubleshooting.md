@@ -1,3 +1,10 @@
+---
+summary: "Common ClawRouter operational failures, false positives, update steps, and verification flows"
+read_when:
+  - "debugging install, wallet, routing, or proxy problems"
+  - "triaging support issues or operator reports"
+---
+
 # Troubleshooting
 
 Quick solutions for common ClawRouter issues.
