@@ -1,3 +1,10 @@
+---
+summary: "Historical implementation plan for ClawRouter E2E coverage, Docker validation, and deployment automation"
+read_when:
+  - "reviewing past plans for E2E coverage or Docker deployment work"
+  - "revisiting historical validation scope for release automation"
+---
+
 # ClawRouter E2E Testing, Docker Validation & Deployment
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.

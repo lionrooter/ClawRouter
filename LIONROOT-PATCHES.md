@@ -44,8 +44,10 @@ Preserve:
 - `src/proxy.degraded-response.test.ts` — degraded-provider fallback behavior
 - `test/fallback.ts` — fallback-chain expectations
 - `test/integration/setup.ts` — preserve upstream worker-scoped integration harness semantics; do not revert to ephemeral port 0
-- `AGENTS.md`
-- `CLAUDE.md`
+- `AGENTS.md` — thin Codex/OpenAI adapter into shared docs
+- `CLAUDE.md` — thin Claude adapter into shared docs
+- `GEMINI.md` — thin Gemini adapter into shared docs
+- `docs/project-context.md` — neutral shared entry point for Claude, Codex, Gemini, and local LLM workflows
 
 ## 3. Current committed Lionroot-only commits vs upstream
 

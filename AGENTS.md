@@ -1,33 +1,30 @@
 # AGENTS.md — ClawRouter
 
-## Project
-15-dimension weighted scoring classifies prompts in <1ms. Routes to cheapest model that can handle each request. MIT licensed, zero external calls.
+Repo boot instructions for Codex and OpenAI tooling. Treat this file as a thin adapter into the shared docs.
 
-## Structure
-```
-src/              ← Routing engine, scoring dimensions, model configs
-docs/             ← Architecture, configuration, features, troubleshooting
-skills/           ← OpenClaw skill integration
-test/             ← Test suites
-scripts/          ← Install and utility scripts
-```
+## Start Here
 
-## Build & Test
-```bash
-npm install
-npm run build     # tsup
-npm test          # vitest
-npm run lint      # eslint
-```
+1. Run `docs-list --path ./docs` (or equivalent) if available.
+2. Read `docs/project-context.md` for the shared repo context.
+3. Read the `docs/` files whose front-matter matches the task.
+4. For non-trivial work, create and approve repo-local `.workflow/prd.md` and `.workflow/plan.md` before editing.
 
-## Docs
-Check `docs/` before making changes. Key files:
-- `docs/architecture.md` — routing engine internals
-- `docs/configuration.md` — model configs, tier definitions
-- `docs/features.md` — scoring dimensions, agentic mode
-- `docs/troubleshooting.md` — common issues
+## Commands
 
-## Related Projects
-- **CLI Proxy**: ~/clawd/openclaw-cli-proxy (receives classified model IDs)
-- **Gateway**: ~/clawdbot (uses ClawRouter via proxy)
-- **Lionroot Hub**: ~/programming_projects/lionroot-openclaw (STRATEGY.md)
+See `docs/project-context.md` for the shared build, test, and docs commands.
+
+## Docs Discovery
+
+Key starting points:
+- `docs/project-context.md`
+- `docs/architecture.md`
+- `docs/configuration.md`
+- `docs/features.md`
+- `docs/routing-profiles.md`
+- `docs/troubleshooting.md`
+- `LIONROOT-PATCHES.md`
+
+## Codex-Specific Notes
+
+- Keep `AGENTS.md` concise; durable detail belongs in `docs/`.
+- For local or generic LLM consumers, the neutral starting point is `docs/project-context.md`.

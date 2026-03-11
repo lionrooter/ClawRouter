@@ -1,3 +1,10 @@
+---
+summary: "Routing profile and pricing reference for eco, auto, premium, and related model choices"
+read_when:
+  - "comparing routing profiles, tiers, and cost tradeoffs"
+  - "changing model selections or pricing documentation"
+---
+
 # Routing Profiles & Pricing
 
 ClawRouter offers four routing profiles to balance cost vs quality. Prices are in **$/M tokens** (input/output).

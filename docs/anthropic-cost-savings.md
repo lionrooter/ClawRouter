@@ -1,3 +1,10 @@
+---
+summary: "Marketing explainer for reducing Anthropic spend by routing simpler requests away from Claude"
+read_when:
+  - "discussing ClawRouter cost-savings positioning"
+  - "editing pricing or vendor-comparison collateral"
+---
+
 # Stop Overpaying for Claude: How ClawRouter Cuts Your Anthropic Bill by 70%
 
 *You love Claude. Your wallet doesn't. Here's how to keep frontier-quality answers — at a fraction of the cost.*

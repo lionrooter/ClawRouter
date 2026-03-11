@@ -1,3 +1,10 @@
+---
+summary: "ClawRouter configuration reference for env vars, wallet/proxy settings, and programmatic usage"
+read_when:
+  - "changing environment variables or wallet/proxy behavior"
+  - "debugging installation or runtime configuration"
+---
+
 # Configuration Reference
 
 Complete reference for ClawRouter configuration options.

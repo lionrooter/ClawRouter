@@ -1,3 +1,10 @@
+---
+summary: "Advanced ClawRouter features such as caching, tool detection, agentic mode, and model aliases"
+read_when:
+  - "evaluating or changing advanced routing features"
+  - "explaining automatic behaviors beyond the core routing loop"
+---
+
 # Advanced Features
 
 ClawRouter v0.5+ includes intelligent routing features that work automatically.
